@@ -1,0 +1,24 @@
+[Unit]
+Description=romsync server and admin dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=romsync
+Group=romsync
+StateDirectory=romsync
+UMask=0077
+# Create this private file with ROMSYNC_ADMIN_TOKEN=<random token, at least 32 characters>.
+EnvironmentFile=/etc/romsync/admin.env
+Environment=HOME=/var/lib/romsync
+ExecStart=/usr/local/bin/romsync-core serve -listen 127.0.0.1:7777 -web-listen 127.0.0.1:8080 -roms /srv/romsync/roms -state /var/lib/romsync
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/romsync/roms
+
+[Install]
+WantedBy=multi-user.target

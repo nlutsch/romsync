@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>romsync / Control room</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="login" class="login-shell">
+    <form id="login-form" class="login-card">
+      <div class="brand"><span class="brand-mark">r/</span>romsync</div>
+      <p class="eyebrow">YOUR LIBRARY. EVERYWHERE.</p>
+      <h1>Welcome to your<br>control room.</h1>
+      <p class="muted">One library, all your devices. Enter your admin token to manage your collection.</p>
+      <label for="token">Admin token</label>
+      <input id="token" type="password" autocomplete="off" required placeholder="Paste your admin token">
+      <button type="submit" class="primary">Open dashboard <span aria-hidden="true">&rarr;</span></button>
+      <p id="login-error" role="alert"></p>
+      <small>Your token stays in this tab's memory, never in browser storage.</small>
+    </form>
+  </div>
+  <div id="dashboard" hidden>
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">r/</span>romsync</div>
+      <p class="eyebrow">CONTROL ROOM</p>
+      <nav aria-label="Main navigation">
+        <button class="nav active" data-tab="library" aria-current="page"><span aria-hidden="true">&#9638;</span> Game library</button>
+        <button class="nav" data-tab="devices"><span aria-hidden="true">&#9635;</span> Devices <span id="pending-badge" class="badge" hidden></span></button>
+        <button class="nav" data-tab="jobs"><span aria-hidden="true">&#8635;</span> Metadata jobs</button>
+      </nav>
+      <div class="sidebar-bottom"><span class="connection">Connected to your server</span><button id="logout" class="quiet">Lock dashboard</button></div>
+    </aside>
+    <main>
+      <header class="topbar"><span>WORKSPACE <span class="slash">/</span> <span id="breadcrumb">Game library</span></span><button id="refresh" class="quiet">Refresh</button></header>
+      <div id="notice" role="status" hidden></div>
+      <section id="library-panel" class="panel">
+        <div class="page-heading"><div><p class="eyebrow">THE COLLECTION</p><h1>Game library<span class="accent">.</span></h1><p class="muted">All your games. Ready for the next session.</p></div><div class="actions"><button id="open-sync">Sync metadata</button><button id="open-upload" class="primary">+ Add ROMs</button></div></div>
+        <div class="stats">
+          <article><span class="stat-label">GAMES IN LIBRARY</span><strong id="game-count">0</strong><small>Local-first. Always yours.</small></article>
+          <article><span class="stat-label">PLATFORMS</span><strong id="platform-count">0</strong><small>One collection, many systems.</small></article>
+          <article><span class="stat-label">CONNECTED DEVICES</span><strong id="device-count">0</strong><small id="approval-count">No pending approvals</small></article>
+          <article><span class="stat-label">LIBRARY SIZE</span><strong id="library-size">0 B</strong><small>Stored on your server.</small></article>
+        </div>
+        <div class="toolbar"><div class="search-wrap"><label class="sr-only" for="search">Search games</label><input id="search" type="search" placeholder="Search your collection..."></div><label class="sr-only" for="platform-filter">Filter platform</label><select id="platform-filter"><option value="">All platforms</option></select><span id="result-count" class="muted"></span></div>
+        <div class="library-browser">
+          <div class="list-pane">
+            <div class="list-heading"><span>YOUR GAMES</span><small>Use &#8593; &#8595; to explore</small></div>
+            <div id="game-list" role="listbox" aria-label="Games" tabindex="0"></div>
+            <div class="pagination"><button id="previous">Previous</button><span id="page-label"></span><button id="next">Next</button></div>
+          </div>
+          <section id="game-detail" class="detail-pane" aria-label="Selected game metadata" aria-live="polite"></section>
+        </div>
+      </section>
+      <section id="devices-panel" class="panel" hidden>
+        <div class="page-heading"><div><p class="eyebrow">YOUR ECOSYSTEM</p><h1>Devices<span class="accent">.</span></h1><p class="muted">Approve new clients or revoke their access. Changes take effect without restarting.</p></div></div>
+        <div id="device-list" class="device-list"></div>
+      </section>
+      <section id="jobs-panel" class="panel" hidden>
+        <div class="page-heading"><div><p class="eyebrow">BEHIND THE SCENES</p><h1>Metadata jobs<span class="accent">.</span></h1><p class="muted">Artwork and game lists, prepared for every profile. One job runs at a time.</p></div><button id="jobs-sync" class="primary">Sync metadata</button></div>
+        <div id="job-list" class="job-list"></div>
+      </section>
+      <footer>romsync <span>/</span> Local games. Seamless sessions.</footer>
+    </main>
+  </div>
+  <dialog id="upload-dialog">
+    <form id="upload-form">
+      <div class="dialog-heading"><h2>Add to your collection</h2><button type="button" class="close" data-close="upload-dialog" aria-label="Close upload dialog">&times;</button></div>
+      <p class="muted">Upload individual ROM files. Existing filenames are never replaced. Metadata sync is queued automatically.</p>
+      <label for="upload-platform">Platform identifier</label><input id="upload-platform" list="platforms" pattern="[a-z0-9][a-z0-9_\-]{0,31}" placeholder="e.g. snes" required>
+      <datalist id="platforms"></datalist>
+      <label for="rom-files">ROM files</label><input id="rom-files" type="file" multiple required>
+      <small id="upload-limit"></small>
+      <progress id="upload-progress" max="100" value="0" hidden></progress>
+      <p id="upload-status" role="status"></p>
+      <button id="upload-submit" type="submit" class="primary">Upload ROMs</button>
+    </form>
+  </dialog>
+  <dialog id="sync-dialog">
+    <form id="sync-form">
+      <div class="dialog-heading"><h2>Bring your games to life</h2><button type="button" class="close" data-close="sync-dialog" aria-label="Close metadata dialog">&times;</button></div>
+      <p class="muted">Gather metadata with Skyscraper and generate artwork for Batocera, Miyoo, and tvOS. Credentials must be configured on the server.</p>
+      <label for="sync-platform">Platform</label><select id="sync-platform" required></select>
+      <button type="submit" class="primary">Queue metadata sync</button>
+    </form>
+  </dialog>
+</body>
+</html>

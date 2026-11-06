@@ -31,8 +31,8 @@ A highly autonomous, lightweight, local-first ROM and game save orchestration en
 - Runs `romsync-core` server engine.
 - Implements manual device approval for authorization.
 - Monitors the master ROM layout via `fsnotify` and triggers server-pushed gRPC catalog streams.
-- Automates metadata scraping with Skyscraper and splits assets into target profiles.
-- **Save Backup Integrity:** Never overwrites save states in-place. Maintains historical snapshots (`/backups/[game].srm.[timestamp]`) for bulletproof disaster recovery.
+- Runs Skyscraper enrichment on demand and generates profile-specific PNG assets and game lists.
+- **Save Backup Integrity:** Never overwrites save states in-place. Every accepted upload is retained as a timestamped snapshot before the current-save pointer is updated. Conflicting uploads are accepted with an explicit conflict flag; the latest committed upload becomes current.
 
 ### 2. Batocera Clients
 - Runs a persistent Go background daemon initiated by `/userdata/system/custom.sh`.
@@ -52,22 +52,266 @@ A highly autonomous, lightweight, local-first ROM and game save orchestration en
 
 ## Getting Started
 
-### Prerequisites
-- Go 1.21+
-- Protocol Buffers compiler (`protoc`)
-- Go plugins for gRPC (`protoc-gen-go` and `protoc-gen-go-grpc`)
+### Repository Layout
 
-### Compiling Protobuf Layouts
-```bash
-protoc --go_out=. --go-grpc_out=. proto/v1/romsync.proto
+One Go module covers the server and future Go clients, sharing the same protobuf contract and generated bindings.
+
+```text
+server/
+  cmd/romsync-core/   Server executable
+  internal/server/   Server implementation and tests
+    web/             Embedded admin dashboard (HTML/CSS/JavaScript)
+  deploy/            Nginx and systemd examples
+  scripts/           Linux and Windows Skyscraper setup
+proto/v1/            Shared protobuf API
+gen/romsync/v1/      Shared generated Go bindings
 ```
 
-### Cross-Compiling Target Binaries
+Future device applications will live under `clients/`, alongside `server/`. Server-only implementation details stay in `server/internal/` so client packages cannot import them. Run the commands below from the repository root.
+
+### Prerequisites
+- Go 1.25+ (older Go installations with automatic toolchain downloads enabled can fetch it).
+- Skyscraper, configured separately with scraper credentials, for optional enrichment.
+- Protocol Buffers compiler (`protoc`) and Go plugins only when changing the API. Generated bindings are checked in.
+
+### Build and Run the Server
+
+The server, shared API, tests, and deployment examples live in this repository. Device applications are not implemented yet.
 
 ```bash
-# Build Server & Batocera Clients
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o bin/romsync-amd64 cmd/client/main.go
+go build -ldflags="-s -w" -o bin/romsync-core ./server/cmd/romsync-core
+mkdir -p roms/snes
+# Place legally obtained ROMs in roms/<platform>/ before starting.
+./bin/romsync-core serve -roms ./roms -state ./data
+```
 
-# Build Miyoo Mini Plus Client
-GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w" -o bin/romsync-miyoo cmd/miyoo/main.go
+The default listener is `127.0.0.1:7777`, intended for a local Nginx TLS reverse proxy. Plaintext listeners are restricted to loopback IPs. For direct remote access, supply both `-tls-cert` and `-tls-key`. Keep the private state directory outside the ROM tree.
+
+gRPC reflection (v1 and v1alpha) is enabled on the same listener. In Postman, create a gRPC request to `127.0.0.1:7777`, disable TLS for this local connection, and load the API using server reflection instead of importing the proto. Reflection exposes service schemas without authentication; sync RPCs still require an approved device token. The Nginx example forwards reflection as well; remove its reflection locations if public schema discovery is unwanted.
+
+ROM layout:
+
+```text
+roms/
+  snes/
+    game.sfc
+  psx/
+    game.chd
+```
+
+Non-hidden regular files beneath each platform are cataloged. Symlinks and hidden trees are excluded. Do not put credentials, saves, unrelated files, or state under the ROM root. Platforms use Skyscraper-compatible directory identifiers. Multi-file games are transferred as individual catalog files; grouping and client launch integration are future work.
+
+### Admin Dashboard
+
+The optional dashboard is embedded in the Go binary; no Node.js runtime or frontend build is required. Device synchronization still uses gRPC exclusively. Browser administration uses a separate HTTP listener, restricted to loopback IPs and intended to sit behind Nginx HTTPS for remote access.
+
+Generate a random admin token and start the dashboard from PowerShell:
+
+```powershell
+$bytes = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($bytes)
+$rng.Dispose()
+$env:ROMSYNC_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)
+# Copy the token into your password manager and use it to unlock the dashboard.
+$env:ROMSYNC_ADMIN_TOKEN
+go run .\server\cmd\romsync-core serve -roms C:\roms -state .\data -web-listen 127.0.0.1:8080
+```
+
+Open `http://127.0.0.1:8080` locally, or your configured HTTPS hostname remotely. The token must have at least 32 characters and is never logged by the server. Keep it private; it grants full administrative access. The UI holds it only in tab memory, not browser storage or cookies; refreshing the page requires unlocking again. Restart with a new environment token to rotate access. Omitting `-web-listen` leaves the HTTP dashboard disabled and preserves gRPC-only operation.
+
+The dashboard provides:
+
+- **Game library:** searchable, platform-filtered, paginated game list with an animated metadata detail pane. Click a game or focus the list and use Up/Down (Home/End jump to the beginning/end). Composite artwork, descriptions, game facts, available media types, sizes, and checksums appear when available. The layout stacks on smaller screens and respects reduced-motion preferences.
+- **Devices:** approve or revoke registered clients without restarting; device credentials are never exposed in dashboard responses.
+- **Add ROMs:** choose an existing platform or enter a new lowercase identifier. Uploads stream to hidden staging files and are atomically published without replacing existing filenames. Individual files are limited to 2 GiB by default (`-max-rom-bytes`); archives are not extracted. Common ROM formats are accepted (`nes`, `sfc`, `smc`, `gb`, `gbc`, `gba`, `n64`, `z64`, `v64`, `zip`, `7z`, `chd`, `cue`, `bin`, `iso`, `rom`, `md`, `gen`, `sms`, `gg`, `pce`, `cso`, `pbp`, `gdi`). Filesystems must support hard links for atomic, no-replace upload publication.
+- **Metadata jobs:** queue a platform manually or automatically after each successful upload. One job runs at a time; queued jobs for the same platform are combined, and uploads during an active job queue another pass. The UI polls every five seconds and shows status, errors, and the most recent 32 KiB of scraper output.
+
+Install/configure Skyscraper for the operating-system user running the server. The dashboard uses the same `-skyscraper`, `-source`, and `-timeout` options as CLI enrichment. If Skyscraper is missing or fails, uploaded ROMs remain available and the metadata job visibly fails; it can be retried after fixing the configuration. Avoid running separate CLI enrichment against the same platform while a dashboard job is active.
+
+The metadata queue holds at most 32 pending jobs and 64 recent history entries, in memory only. Shutdown cancels active/queued jobs; restarting clears history, so rerun incomplete jobs. If queuing or catalog refresh fails after a ROM was stored, the upload response explicitly reports a warning instead of suggesting a retry that could duplicate the file.
+
+### Admin HTTP API
+
+All `/api/` routes require `Authorization: Bearer <admin-token>` (this is separate from device tokens). No CORS access is enabled. The static login page exposes no library data. The API is intended for administrators, not device clients:
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| GET | `/api/library` | Games with metadata and asset IDs, platforms, and upload limit |
+| GET | `/api/devices` | Registered devices without token hashes |
+| POST | `/api/devices/{id}` | Approve/revoke with `{"approved":true}` |
+| GET | `/api/jobs` | Recent metadata jobs and output |
+| POST | `/api/jobs` | Queue with `{"platform":"snes"}` |
+| PUT | `/api/roms?platform=snes&name=game.sfc` | Raw ROM body, duplicate filenames return HTTP 409 |
+| GET | `/api/media?id=...` | Cataloged PNG artwork |
+
+### Device Approval
+
+Clients call `RegisterDevice` with a name and a profile (`BATOCERA`, `MIYOO`, or `TVOS`) and securely retain the returned token. Enrollment does not grant access. Administrators approve devices locally:
+
+```bash
+./bin/romsync-core devices -state ./data
+./bin/romsync-core approve -state ./data -device <device-id>
+./bin/romsync-core revoke -state ./data -device <device-id>
+```
+
+All sync RPCs require `authorization: Bearer <token>` metadata. Tokens are stored only as SHA-256 hashes on the server. Approval changes apply without restarting; idle catalog streams recheck approval every five seconds. Lost tokens require a new registration. Enrollment is capped at 1,024 registrations; remove unused device JSON files locally to reclaim slots. Rate-limit public enrollment at the reverse proxy if exposed to untrusted networks.
+
+### Sync Contract
+
+The API is defined in [proto/v1/romsync.proto](proto/v1/romsync.proto).
+
+- `WatchCatalog` sends an initial full manifest and subsequent changed manifests (up to 32 MiB; clients must configure their receive limit accordingly). Recursive filesystem events are debounced; a 30-second reconciliation scan catches missed events. Scans hash files using bounded buffers. Large libraries may need future incremental indexing.
+- `DownloadFile` requires a catalog ID and its advertised SHA-256. Data chunks are at most 64 KiB. Clients must verify the final RPC status and checksum before atomically installing any download; a changing source aborts the transfer.
+- Optional `assets` on `RegisterDevice` saves a device's media preferences; approved clients can change them with `SetAssetPreferences`. `WatchCatalog` and `DownloadFile` accept per-request overrides. Omitted selections use saved preferences, or **composite artwork only** for devices without preferences. An explicit `{"assets": {}}` selects no media, while retaining ROMs and textual metadata. Types must be unique and cannot include `ASSET_UNSPECIFIED`.
+- Available types are `COMPOSITE`, `BOXART`, `SCREENSHOT`, `WHEEL` (logo), `MARQUEE`, `FANART`, `VIDEO`, and `MANUAL` (guide/PDF). Only media actually available from the scraper is delivered. Profiles still control image dimensions and platform compatibility. The web dashboard always uses composites independently of device preferences.
+- For example, send `{"assets":{"types":["BOXART","SCREENSHOT","VIDEO","MANUAL"]}}` to `SetAssetPreferences` in Postman. Subsequent catalog/download requests can omit `assets`. If overriding a watch request, use the **same override on downloads** so filtered game-list checksums agree. Changing saved preferences notifies existing catalog streams.
+- Media catalog entries include `asset_type`, associated ROM `game_id`, and `target_path` relative to the client's platform directory. Server-side generated files live in `romsync-data`, but logical IDs remain `<platform>/...`; clients must not copy that server storage prefix. Downloaded game lists reference client-relative media paths and include only requested, available media; their advertised checksums/sizes describe those exact filtered bytes. Screenshots use `<image>` when composites are not requested or available, otherwise `<screenshot>` alongside the composite `<image>`. Clients can use typed media entries to adapt placement to their frontend.
+- `CheckSaveState` takes a catalog ROM ID, local SHA-256 (empty for no local save), and the last synchronized revision (empty on first sync). Revisions are content hashes. Results are `UP_TO_DATE`, `SERVER_IS_NEWER`, `CLIENT_IS_NEWER`, or `CONFLICT`.
+- `UploadSave` starts with a header-only `FileChunk` containing `game_id`, `sha256`, and optional `base_revision`. Subsequent chunks contain only `data`, at most 64 KiB each. The default total limit is 64 MiB (`-max-save-bytes`). The server validates the checksum before committing. Uploads with a stale base are accepted, backed up, and marked `replaced_conflict` when both sides changed. Concurrent uploads are committed in completion order, not device-clock order.
+- `DownloadSave` requires the revision returned by `CheckSaveState`. Clients must stage and verify data before replacing local saves.
+
+Saves are shared across approved devices by exact ROM catalog ID. This initial API supports one save blob per ROM, not multiple save slots or accounts. Moving/renaming a ROM changes its save key. The server does not delete backup history automatically.
+
+### Metadata and Image Enrichment
+
+#### Set Up Skyscraper
+
+The setup scripts install a pinned official Skyscraper **3.21.1** AppImage for x86_64 or aarch64, check its SHA-256 against the upstream release digest, and extract the bundled runtime so FUSE is not required. They do not download ROMs, request credentials, upgrade the operating system, or replace existing configuration. The binary requires a glibc-based Linux distribution with glibc 2.35+ (for example Ubuntu 22.04/24.04 or current Arch Linux). Alpine/musl and older distributions are not supported by this binary installer.
+
+**Windows (native romsync, Skyscraper in WSL):**
+
+```powershell
+# Only if a suitable distribution is not already installed:
+wsl --install -d Ubuntu-24.04
+# Launch it once and complete its Linux username/password setup.
+wsl -d Ubuntu-24.04
+
+# From the repository root in PowerShell:
+.\server\scripts\setup-skyscraper.ps1
+```
+
+The script defaults to `Ubuntu-24.04`; select another compatible distribution with `-Distribution <name>`. It requires WSL already installed and initialized. The installer checks the CLI and reports missing libraries; on a minimal Ubuntu installation, run `sudo apt-get update && sudo apt-get install libopengl0` inside that distribution, then rerun the script.
+
+Edit the private Linux config without copying credentials into this repository:
+
+```powershell
+wsl -d Ubuntu-24.04 --cd ~ -- nano .local/share/romsync/skyscraper/config.ini
+```
+
+Under `[screenscraper]`, uncomment `userCreds` and replace its placeholder with your [ScreenScraper](https://www.screenscraper.fr/) username and password. Keep the value double-quoted and escape literal backslashes/double quotes as `\\`/`\"`. The config is mode `0600`; the server never receives these credentials as command-line arguments. Do not share that file or scraper logs that may contain account details.
+
+Keep your usual admin-token environment variable and add the WSL flag when starting the Windows server:
+
+```powershell
+go run .\server\cmd\romsync-core serve -roms C:\roms -state .\data -web-listen 127.0.0.1:8080 -skyscraper-wsl Ubuntu-24.04
+
+# Or perform one enrichment directly:
+go run .\server\cmd\romsync-core enrich -roms C:\roms -platform snes -skyscraper-wsl Ubuntu-24.04
+```
+
+romsync translates Windows paths using `wslpath`, runs Skyscraper's gathering/export stages in the selected distribution, and converts exported Linux paths back into client-relative asset paths. `C:\roms` stays on Windows. The default executable resolves to the WSL user's `~/.local/bin/Skyscraper`; if overriding `-skyscraper` in WSL mode, supply the absolute **Linux** launcher path, not a Windows path. Run setup and romsync under the same Windows account and WSL default user. WSL is not used by native Linux servers.
+
+**Linux:**
+
+```bash
+bash server/scripts/setup-skyscraper.sh
+# Edit the private configuration and set [screenscraper] userCreds:
+nano "$HOME/.local/share/romsync/skyscraper/config.ini"
+
+./bin/romsync-core serve -roms ./roms -state ./data \
+  -skyscraper "$HOME/.local/bin/Skyscraper"
+```
+
+Prerequisites are Bash, curl, CA certificates, GNU core utilities, and the OpenGL runtime (`libopengl0` on Debian/Ubuntu, `libglvnd` on Arch). Install missing prerequisites with your distribution's package manager. No root privileges are needed for the script itself. On minimal/headless systems, additional runtime libraries may be required; the final CLI verification surfaces loader errors explicitly.
+
+Defaults are `~/.local/share/romsync/skyscraper` for the release, private config, and resource cache, and `~/.local/bin/Skyscraper` for the launcher. Use `--prefix /absolute/path --bin-dir /absolute/path` to customize them. The script refuses to overwrite an unrelated launcher. Re-running verifies the existing installation and preserves credentials. Keep this directory outside the ROM root and outside the repository.
+
+For the systemd example, run setup as the service user with its configured home (for example `sudo -u romsync env HOME=/var/lib/romsync bash server/scripts/setup-skyscraper.sh`) after creating that user's home/state directory. Set `-skyscraper /var/lib/romsync/.local/bin/Skyscraper` in `ExecStart`, and configure ScreenScraper under `/var/lib/romsync/.local/share/romsync/skyscraper/config.ini`.
+
+Upstream documentation: [installation](https://github.com/Gemba/skyscraper#-how-to-install-skyscraper) and [configuration](https://gemba.github.io/skyscraper/CONFIGINI/).
+
+#### Run Enrichment
+
+Run enrichment from the dashboard, or as a separate command with write access to the ROM tree:
+
+```bash
+./bin/romsync-core enrich -roms ./roms -platform snes -source screenscraper
+```
+
+This gathers metadata into Skyscraper's external cache, exports independent media and composite artwork, then generates profile assets under **`<ROM root>/romsync-data/<platform>/`**. ROM platform directories are not modified. A separate logo export avoids Skyscraper's EmulationStation convention of substituting wheel logos for marquees.
+
+For example:
+
+```text
+C:\roms\
+  snes\                         ROM files only
+  nes\                          ROM files only
+  romsync-data\                 Reserved generated-data folder, not a platform
+    snes\
+      gamelist.xml
+      miyoogamelist.xml
+      tvosgamelist.xml
+      media\
+        batocera\
+          composite\            Combined artwork for the dashboard
+          boxart\               Individual images for client frontends
+          screenshot\
+          wheel\
+          marquee\
+          fanart\
+          video\
+          manual\
+        miyoo\                  Same asset-type layout, smaller images
+        tvos\                   Same asset-type layout, larger images
+      .enrichment\              Raw scraper export and artwork rules
+      .logos\                   Separate wheel/marquee export
+      .composite\               Composite scraper export
+```
+
+Only available media folders/files are created. Filenames are derived from ROM-relative paths to avoid collisions. The three generated game lists and PNG image bounds are:
+
+| Profile | Game list | Maximum PNG dimensions |
+|---------|-----------|------------------------|
+| Batocera | `gamelist.xml` | 1280 x 960 |
+| Miyoo Mini Plus | `miyoogamelist.xml` | 640 x 480 |
+| tvOS | `tvosgamelist.xml` | 1920 x 1080 |
+
+Each image is resized independently, preserving aspect ratio without upscaling. PNG/JPEG inputs are supported, with a 40-megapixel input limit. Textual metadata is retained. Videos and manuals are copied unchanged using bounded buffers rather than loaded into server memory. Skyscraper's private configuration/resource cache remains outside the ROM tree at the installer location described above. The running server publishes changed files automatically. Schedule this command with your preferred system timer if desired; scraping failures exit nonzero. Use `-skyscraper` to select the binary and `-timeout` to override the 30-minute limit.
+
+#### Existing Metadata Files
+
+There is **no automatic migration or deletion**. Finish or stop jobs running with the old server, restart with the updated application, and sync each platform again to populate `romsync-data`. Existing platform-local game lists and `media`/`.enrichment` folders are ignored by the new catalog and left untouched. After verifying the new exports, you may manually remove only the old generated `.enrichment`, `media`, `gamelist.xml`, `miyoogamelist.xml`, and `tvosgamelist.xml` inside each platform folder. Preserve any manually maintained files and do not remove ROMs or the new `romsync-data` folder.
+
+tvOS catalogs allow only `nes`, `snes`, `gb`, `gbc`, `gba`, `megadrive`, `genesis`, `mastersystem`, `gamegear`, `pcengine`, `psx`, `n64`, and `dreamcast`. Each profile receives only its own media and game list. Actual emulator support remains the client's responsibility.
+
+### Persistence and Deployment
+
+The private state directory contains `devices/` (hashed tokens and approval), `saves/` (atomic current-save pointers), and `backups/` (immutable, timestamped save uploads). Files are synced before publication; directory changes are also synced on Linux (Windows does not support this through Go's directory handles). Incomplete or invalid uploads do not change the current pointer. A failure during final publication can have an uncertain outcome: reconcile using `CheckSaveState` before retrying. A crash between snapshot creation and pointer replacement can leave an unreferenced snapshot, which is deliberately retained. Back up the entire state directory; do not prune files referenced by current-save pointers. Run only one server process per state directory.
+
+See [server/deploy/nginx.conf](server/deploy/nginx.conf) and [server/deploy/romsync.service](server/deploy/romsync.service). Create a dedicated `romsync` service account, grant it read/write access to `/srv/romsync/roms` for uploads and enrichment, install the binary at `/usr/local/bin/romsync-core`, and adjust the example hostname/certificates. The systemd unit creates `/var/lib/romsync` and sets it as the service's `HOME` so Skyscraper can keep its configuration/cache there despite `ProtectHome=true`. Create `/etc/romsync/admin.env` containing `ROMSYNC_ADMIN_TOKEN=<your random token>`, owned by root with mode `0600`; systemd reads this file before starting the service. Configure Skyscraper using that home directory as the service user, not root.
+
+Nginx routes `/` to the HTTP dashboard and the gRPC service paths to the gRPC listener. The dashboard location allows 2 GiB uploads with request buffering disabled; keep that limit aligned with `-max-rom-bytes`. Only Nginx's HTTPS port should be publicly reachable. For a read-only, gRPC-only deployment, remove `-web-listen` and `EnvironmentFile` from the unit, use `ReadOnlyPaths` for the ROM directory, and remove Nginx's dashboard location.
+
+No client retry loop is needed inside the server: clients should reconnect streams with bounded exponential backoff and jitter after network failures. Save uploads require an explicit success response before the client updates its synchronized revision; an uncertain result should be reconciled with `CheckSaveState`.
+
+### Development
+
+```bash
+go test ./...
+go vet ./...
+
+# Optional offline Windows-to-WSL integration test (PowerShell):
+# $env:ROMSYNC_TEST_WSL = "Ubuntu-24.04"
+# go test -count=1 -run TestWSLEnrichment -v ./server/internal/server
+
+# Regenerate the shared API after editing the proto.
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+protoc --go_out=. --go_opt=module=github.com/nlutsch/romsync \
+  --go-grpc_out=. --go-grpc_opt=module=github.com/nlutsch/romsync \
+  proto/v1/romsync.proto
+
+# Linux server binary
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o bin/romsync-core ./server/cmd/romsync-core
 ```

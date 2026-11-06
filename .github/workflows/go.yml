@@ -1,0 +1,22 @@
+name: Go
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: bash -n server/scripts/setup-skyscraper.sh
+      - run: go test -race ./...
+      - run: go build -ldflags="-s -w" -o bin/romsync-core ./server/cmd/romsync-core

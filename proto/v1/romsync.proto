@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package romsync.v1;
+option go_package = "github.com/nlutsch/romsync/gen/romsync/v1;romsyncv1";
+
+service RomSync {
+  // Enrollment returns a secret once. An administrator must approve the device.
+  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+  rpc SetAssetPreferences(SetAssetPreferencesRequest) returns (AssetSelection);
+  rpc WatchCatalog(WatchCatalogRequest) returns (stream Catalog);
+  rpc DownloadFile(DownloadFileRequest) returns (stream FileChunk);
+  rpc CheckSaveState(CheckSaveStateRequest) returns (CheckSaveStateResponse);
+  // The first chunk carries game_id, base_revision and checksum; following chunks carry data.
+  rpc UploadSave(stream FileChunk) returns (SaveRevision);
+  rpc DownloadSave(DownloadSaveRequest) returns (stream FileChunk);
+}
+
+enum Profile {
+  PROFILE_UNSPECIFIED = 0;
+  BATOCERA = 1;
+  MIYOO = 2;
+  TVOS = 3;
+}
+
+enum AssetType {
+  ASSET_UNSPECIFIED = 0;
+  COMPOSITE = 1;
+  BOXART = 2;
+  SCREENSHOT = 3;
+  WHEEL = 4;
+  MARQUEE = 5;
+  FANART = 6;
+  VIDEO = 7;
+  MANUAL = 8;
+}
+// Absent selection uses saved preferences, then composite-only defaults.
+// Present but empty selection means ROMs and metadata without media.
+message AssetSelection { repeated AssetType types = 1; }
+message SetAssetPreferencesRequest { AssetSelection assets = 1; }
+message RegisterDeviceRequest { string name = 1; Profile profile = 2; AssetSelection assets = 3; }
+message RegisterDeviceResponse { string device_id = 1; string token = 2; }
+message WatchCatalogRequest { AssetSelection assets = 1; }
+message Catalog {
+  string revision = 1;
+  repeated CatalogEntry entries = 2;
+}
+message CatalogEntry {
+  string id = 1;
+  string platform = 2;
+  string title = 3;
+  int64 size = 4;
+  string sha256 = 5;
+  string kind = 6;
+  AssetType asset_type = 7;
+  string game_id = 8;
+  string target_path = 9;
+}
+message DownloadFileRequest { string id = 1; string sha256 = 2; AssetSelection assets = 3; }
+message FileChunk {
+  bytes data = 1;
+  string game_id = 2;
+  string base_revision = 3;
+  string sha256 = 4;
+}
+enum SaveState {
+  UP_TO_DATE = 0;
+  SERVER_IS_NEWER = 1;
+  CLIENT_IS_NEWER = 2;
+  CONFLICT = 3;
+}
+message CheckSaveStateRequest {
+  string game_id = 1;
+  string base_revision = 2;
+  string sha256 = 3;
+}
+message CheckSaveStateResponse { SaveState state = 1; SaveRevision server = 2; }
+message SaveRevision {
+  string revision = 1;
+  string sha256 = 2;
+  int64 size = 3;
+  bool replaced_conflict = 4;
+}
+message DownloadSaveRequest { string game_id = 1; string revision = 2; }
