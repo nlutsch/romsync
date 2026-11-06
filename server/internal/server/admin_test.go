@@ -19,7 +19,7 @@ import (
 	pb "github.com/nlutsch/romsync/gen/romsync/v1"
 )
 
-const testAdminToken = "test-only-admin-token-not-for-production"
+const testDashboardSession = "test-only-session-not-for-production"
 
 func setupAdmin(t *testing.T, f *fixture, maxROM int64) *Admin {
 	t.Helper()
@@ -27,18 +27,36 @@ func setupAdmin(t *testing.T, f *fixture, maxROM int64) *Admin {
 	if err != nil {
 		t.Fatal(err)
 	}
-	admin, err := NewAdmin(f.ctx, f.s, AdminOptions{Token: testAdminToken, MaxROMBytes: maxROM, Skyscraper: binary, Source: "screenscraper", Timeout: 10 * time.Second})
+	store, err := LoadConfig(filepath.Join(t.TempDir(), "romsync.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := MakeLogin("admin", "test-password-not-real")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuth(auth, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	control, err := NewControl(store, f.s.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control.sessions[digest(testDashboardSession)] = dashboardSession{expires: time.Now().Add(time.Hour), auth: auth}
+	admin, err := NewAdmin(f.ctx, f.s, AdminOptions{Control: control, MaxROMBytes: maxROM, Skyscraper: binary, Source: "screenscraper", Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(admin.Close)
+	control.SetRuntime(admin, store.Snapshot().Settings, nil)
 	return admin
 }
 
 func adminRequest(t *testing.T, a *Admin, method, target, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	r := httptest.NewRequest(method, target, strings.NewReader(body))
-	r.Header.Set("Authorization", "Bearer "+testAdminToken)
+	r := httptest.NewRequest(method, "http://127.0.0.1:8080"+target, strings.NewReader(body))
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: testDashboardSession})
+	r.Header.Set("X-Romsync-Request", "1")
 	w := httptest.NewRecorder()
 	a.ServeHTTP(w, r)
 	return w
@@ -80,7 +98,7 @@ func TestAdminAuthAndAssets(t *testing.T) {
 	f := setup(t, 1024)
 	a := setupAdmin(t, f, 1024)
 	for _, endpoint := range []string{"/api/library", "/api/devices", "/api/jobs", "/api/media?id=x", "/api/roms"} {
-		r := httptest.NewRequest(http.MethodGet, endpoint, nil)
+		r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080"+endpoint, nil)
 		w := httptest.NewRecorder()
 		a.ServeHTTP(w, r)
 		if w.Code != http.StatusUnauthorized {
@@ -93,8 +111,8 @@ func TestAdminAuthAndAssets(t *testing.T) {
 			t.Fatal("wrong token accepted")
 		}
 	}
-	r := httptest.NewRequest(http.MethodGet, "/api/library", nil)
-	r.Header.Set("Authorization", "Bearer "+testAdminToken)
+	r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/library", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: testDashboardSession})
 	r.Header.Set("Sec-Fetch-Site", "cross-site")
 	w := httptest.NewRecorder()
 	a.ServeHTTP(w, r)
@@ -238,9 +256,10 @@ func TestAdminUploadValidation(t *testing.T) {
 		}
 	}
 	// Unknown-length bodies must be bounded too.
-	r := httptest.NewRequest(http.MethodPut, "/api/roms?platform=snes&name=stream.sfc", strings.NewReader("0123456789"))
+	r := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:8080/api/roms?platform=snes&name=stream.sfc", strings.NewReader("0123456789"))
 	r.ContentLength = -1
-	r.Header.Set("Authorization", "Bearer "+testAdminToken)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: testDashboardSession})
+	r.Header.Set("X-Romsync-Request", "1")
 	w := httptest.NewRecorder()
 	a.ServeHTTP(w, r)
 	if w.Code != http.StatusRequestEntityTooLarge {
@@ -356,9 +375,9 @@ func TestJobQueueCoalescingAndShutdown(t *testing.T) {
 func TestAdminRejectsWeakConfiguration(t *testing.T) {
 	f := setup(t, 1024)
 	for _, options := range []AdminOptions{
-		{Token: "short", MaxROMBytes: 1024, Skyscraper: "x", Source: "x", Timeout: time.Minute},
-		{Token: testAdminToken, MaxROMBytes: 0, Skyscraper: "x", Source: "x", Timeout: time.Minute},
-		{Token: testAdminToken, MaxROMBytes: 1024, Skyscraper: "x", Source: "x", Timeout: 0},
+		{MaxROMBytes: 1024, Skyscraper: "x", Source: "x", Timeout: time.Minute},
+		{Control: setupAdmin(t, f, 1024).control, MaxROMBytes: 0, Skyscraper: "x", Source: "x", Timeout: time.Minute},
+		{Control: setupAdmin(t, f, 1024).control, MaxROMBytes: 1024, Skyscraper: "x", Source: "x", Timeout: 0},
 	} {
 		if admin, err := NewAdmin(f.ctx, f.s, options); err == nil {
 			admin.Close()
@@ -370,8 +389,9 @@ func TestAdminRejectsWeakConfiguration(t *testing.T) {
 func TestAdminInterruptedUpload(t *testing.T) {
 	f := setup(t, 1024)
 	a := setupAdmin(t, f, 1024)
-	r := httptest.NewRequest(http.MethodPut, "/api/roms?platform=snes&name=broken.sfc", nil)
-	r.Header.Set("Authorization", "Bearer "+testAdminToken)
+	r := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:8080/api/roms?platform=snes&name=broken.sfc", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: testDashboardSession})
+	r.Header.Set("X-Romsync-Request", "1")
 	r.Body = io.NopCloser(io.MultiReader(bytes.NewBufferString("partial"), errorReader{}))
 	w := httptest.NewRecorder()
 	a.ServeHTTP(w, r)

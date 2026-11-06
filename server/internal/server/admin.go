@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"encoding/xml"
@@ -29,7 +27,7 @@ import (
 var adminAssets embed.FS
 
 type AdminOptions struct {
-	Token           string
+	Control         *Control
 	MaxROMBytes     int64
 	Skyscraper      string
 	WSLDistribution string
@@ -38,16 +36,16 @@ type AdminOptions struct {
 }
 
 type Admin struct {
-	server    *Server
-	tokenHash [32]byte
-	maxROM    int64
-	jobs      *jobQueue
-	handler   http.Handler
+	server  *Server
+	control *Control
+	maxROM  int64
+	jobs    *jobQueue
+	handler http.Handler
 }
 
 func NewAdmin(ctx context.Context, s *Server, options AdminOptions) (*Admin, error) {
-	if len(options.Token) < 32 || strings.TrimSpace(options.Token) != options.Token {
-		return nil, fmt.Errorf("ROMSYNC_ADMIN_TOKEN must contain at least 32 characters with no surrounding whitespace")
+	if options.Control == nil {
+		return nil, fmt.Errorf("dashboard control is required")
 	}
 	if options.MaxROMBytes <= 0 || options.MaxROMBytes > 1<<40 {
 		return nil, fmt.Errorf("max ROM bytes must be between 1 and 1 TiB")
@@ -55,7 +53,7 @@ func NewAdmin(ctx context.Context, s *Server, options AdminOptions) (*Admin, err
 	if options.Timeout <= 0 || options.Skyscraper == "" || options.Source == "" {
 		return nil, fmt.Errorf("metadata timeout, executable and source are required")
 	}
-	a := &Admin{server: s, tokenHash: sha256.Sum256([]byte(options.Token)), maxROM: options.MaxROMBytes}
+	a := &Admin{server: s, control: options.Control, maxROM: options.MaxROMBytes}
 	a.jobs = newJobQueue(ctx, func(ctx context.Context, platform string, out io.Writer) error {
 		ctx, cancel := context.WithTimeout(ctx, options.Timeout)
 		defer cancel()
@@ -82,43 +80,11 @@ func NewAdmin(ctx context.Context, s *Server, options AdminOptions) (*Admin, err
 	mux.HandleFunc("POST /api/jobs", a.startJob)
 	mux.HandleFunc("PUT /api/roms", a.upload)
 	mux.HandleFunc("GET /api/media", a.media)
-	api := mux
-	files, err := fs.Sub(adminAssets, "web")
-	if err != nil {
-		a.Close()
-		return nil, err
-	}
-	static := http.FileServer(http.FS(files))
-	a.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-		w.Header().Set("Cache-Control", "no-store")
-		if strings.HasPrefix(r.URL.Path, "/api/") {
-			values := r.Header.Values("Authorization")
-			got := sha256.Sum256([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))
-			if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") || subtle.ConstantTimeCompare(got[:], a.tokenHash[:]) != 1 {
-				a.fail(w, http.StatusUnauthorized, "admin token required")
-				return
-			}
-			if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
-				a.fail(w, http.StatusForbidden, "cross-site requests are not allowed")
-				return
-			}
-			api.ServeHTTP(w, r)
-			return
-		}
-		if r.URL.Path != "/" && r.URL.Path != "/app.js" && r.URL.Path != "/style.css" {
-			http.NotFound(w, r)
-			return
-		}
-		static.ServeHTTP(w, r)
-	})
+	a.handler = mux
 	return a, nil
 }
 
-func (a *Admin) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.handler.ServeHTTP(w, r) }
+func (a *Admin) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.control.ServeHTTP(w, r) }
 func (a *Admin) Close()                                           { a.jobs.close() }
 
 func (a *Admin) json(w http.ResponseWriter, code int, value any) {

@@ -8,10 +8,8 @@ User=romsync
 Group=romsync
 StateDirectory=romsync
 UMask=0077
-# Create this private file with ROMSYNC_ADMIN_TOKEN=<random token, at least 32 characters>.
-EnvironmentFile=/etc/romsync/admin.env
 Environment=HOME=/var/lib/romsync
-ExecStart=/usr/local/bin/romsync-core serve -listen 127.0.0.1:7777 -web-listen 127.0.0.1:8080 -roms /srv/romsync/roms -state /var/lib/romsync
+ExecStart=/usr/local/bin/romsync-core -config /var/lib/romsync/romsync.json
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

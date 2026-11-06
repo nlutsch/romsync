@@ -82,10 +82,26 @@ The server, shared API, tests, and deployment examples live in this repository. 
 go build -ldflags="-s -w" -o bin/romsync-core ./server/cmd/romsync-core
 mkdir -p roms/snes
 # Place legally obtained ROMs in roms/<platform>/ before starting.
-./bin/romsync-core serve -roms ./roms -state ./data
+./bin/romsync-core
 ```
 
-The default listener is `127.0.0.1:7777`, intended for a local Nginx TLS reverse proxy. Plaintext listeners are restricted to loopback IPs. For direct remote access, supply both `-tls-cert` and `-tls-key`. Keep the private state directory outside the ROM tree.
+Open **http://127.0.0.1:8080** and complete first-run setup: choose your ROM directory, state directory, and dashboard login or anonymous access. No ROM path or environment token is needed to launch the executable. Device sync starts after setup.
+
+The default gRPC listener is `127.0.0.1:7777`, intended for a local Nginx TLS reverse proxy. Plaintext listeners are restricted to loopback IPs. For direct remote gRPC access, configure both TLS certificate and private key paths in Settings. Keep the private state directory, configuration file, and TLS private key outside the ROM tree.
+
+Configuration is saved atomically to **`romsync.json` beside the executable**, with restrictive file permissions where supported. The default private state directory is `data` beside that configuration file. Use `-config <path>` to select a different file, especially for installed services or development:
+
+```powershell
+# Development: go run creates a temporary executable, so use a stable config path.
+go run .\server\cmd\romsync-core -config .\romsync.json
+
+# Installed executable with an alternate configuration:
+.\bin\romsync-core.exe -config C:\romsync\romsync.json
+```
+
+Explicit CLI flags override saved settings for that invocation. Web saves persist those effective values, and service restarts apply the saved file without reapplying original flags. Relative paths in the configuration/UI resolve against the configuration file's directory; explicit CLI filesystem paths resolve against the invocation directory. WSL executable paths remain Linux paths. ROM folders must already exist; the server creates private state directories, but does not move your files.
+
+If existing ROM storage becomes unavailable, the dashboard remains available to correct settings. Invalid JSON, unsupported config versions, or an invalid/unavailable initial dashboard address produce explicit startup errors; fix the file or use the appropriate CLI override. If a changed dashboard port cannot be bound during a web-triggered restart, the old address remains available and Settings reports the failure.
 
 gRPC reflection (v1 and v1alpha) is enabled on the same listener. In Postman, create a gRPC request to `127.0.0.1:7777`, disable TLS for this local connection, and load the API using server reflection instead of importing the proto. Reflection exposes service schemas without authentication; sync RPCs still require an approved device token. The Nginx example forwards reflection as well; remove its reflection locations if public schema discovery is unwanted.
 
@@ -103,22 +119,36 @@ Non-hidden regular files beneath each platform are cataloged. Symlinks and hidde
 
 ### Admin Dashboard
 
-The optional dashboard is embedded in the Go binary; no Node.js runtime or frontend build is required. Device synchronization still uses gRPC exclusively. Browser administration uses a separate HTTP listener, restricted to loopback IPs and intended to sit behind Nginx HTTPS for remote access.
+The dashboard is embedded in the Go binary and starts by default; no Node.js runtime or frontend build is required. Device synchronization still uses gRPC exclusively. Browser administration uses a separate HTTP listener, restricted to loopback IPs and intended to sit behind Nginx HTTPS for remote access.
 
-Generate a random admin token and start the dashboard from PowerShell:
+Launch the compiled executable, then visit its logged dashboard URL:
 
 ```powershell
-$bytes = New-Object byte[] 32
-$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-$rng.GetBytes($bytes)
-$rng.Dispose()
-$env:ROMSYNC_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)
-# Copy the token into your password manager and use it to unlock the dashboard.
-$env:ROMSYNC_ADMIN_TOKEN
-go run .\server\cmd\romsync-core serve -roms C:\roms -state .\data -web-listen 127.0.0.1:8080
+.\bin\romsync-core.exe
 ```
 
-Open `http://127.0.0.1:8080` locally, or your configured HTTPS hostname remotely. The token must have at least 32 characters and is never logged by the server. Keep it private; it grants full administrative access. The UI holds it only in tab memory, not browser storage or cookies; refreshing the page requires unlocking again. Restart with a new environment token to rotate access. Omitting `-web-listen` leaves the HTTP dashboard disabled and preserves gRPC-only operation.
+First-run setup is available only through a direct loopback connection, not through the reverse proxy. For a headless server, use an SSH local port forward to its loopback dashboard, for example `ssh -L 8080:127.0.0.1:8080 user@server`, then browse `http://127.0.0.1:8080`. For remote access, set the **Public dashboard HTTPS URL** to your Nginx origin (for example `https://romsync.example.com`). Only that hostname and loopback hosts are accepted for API access, preventing DNS rebinding in anonymous mode. After setup, use the local URL or your configured HTTPS hostname remotely.
+
+Choose either:
+
+- **Login (recommended):** one administrator username/password, with a minimum 12-character password. The file contains a random salt and PBKDF2-HMAC-SHA256 hash (600,000 iterations), never the plaintext password. Login creates a random HttpOnly, SameSite=Strict cookie valid for 12 hours; HTTPS sessions also use Secure cookies. Refreshing the page retains the session. Sign-out invalidates that session. Password/access changes and process restarts invalidate all sessions; web-triggered service restarts preserve them. Login attempts are rate-limited.
+- **Anonymous administration:** anyone who can reach the dashboard has full access, including uploads, device approval, configuration, and restarts. Do not expose this mode to untrusted networks. It does **not** disable device approval or device tokens.
+
+Settings lets you change access mode or replace the login later. Changing an existing login or disabling it requires the current password. The old `ROMSYNC_ADMIN_TOKEN` environment variable and dashboard Bearer-token authentication are no longer used.
+
+#### Forgotten Password
+
+With CLI access, stop the running server (or stop its systemd service), run:
+
+```powershell
+.\bin\romsync-core.exe reset-password
+# If using a custom configuration:
+.\bin\romsync-core.exe reset-password -config C:\romsync\romsync.json
+# To replace anonymous access with a login:
+.\bin\romsync-core.exe reset-password -username admin
+```
+
+Enter and confirm a new password at the prompts; interactive terminal input is hidden. No old password is required, and no password is supplied in command-line arguments. The saved username is reused unless `-username` is provided. Start the server again after resetting. Do not delete the configuration or state directory to recover access; device approvals and saves are unaffected. Restrict filesystem access to the config file, since anyone who can modify it controls dashboard access.
 
 The dashboard provides:
 
@@ -126,6 +156,7 @@ The dashboard provides:
 - **Devices:** approve or revoke registered clients without restarting; device credentials are never exposed in dashboard responses.
 - **Add ROMs:** choose an existing platform or enter a new lowercase identifier. Uploads stream to hidden staging files and are atomically published without replacing existing filenames. Individual files are limited to 2 GiB by default (`-max-rom-bytes`); archives are not extracted. Common ROM formats are accepted (`nes`, `sfc`, `smc`, `gb`, `gbc`, `gba`, `n64`, `z64`, `v64`, `zip`, `7z`, `chd`, `cue`, `bin`, `iso`, `rom`, `md`, `gen`, `sms`, `gg`, `pce`, `cso`, `pbp`, `gdi`). Filesystems must support hard links for atomic, no-replace upload publication.
 - **Metadata jobs:** queue a platform manually or automatically after each successful upload. One job runs at a time; queued jobs for the same platform are combined, and uploads during an active job queue another pass. The UI polls every five seconds and shows status, errors, and the most recent 32 KiB of scraper output.
+- **Settings:** configure ROM/state directories, gRPC and dashboard addresses, the public HTTPS origin, TLS paths, upload limits, Skyscraper executable/WSL distribution/source/timeout, and dashboard access. **Save settings** persists without changing running sync services. **Save and restart services** applies changes without exiting the executable; **Restart services** applies already-saved settings. Restart confirmation warns about disconnecting transfers, cancelling metadata jobs, and clearing job history. Existing ROMs, device records, and saves are not migrated when paths change. A different dashboard port requires opening its new URL and updating proxy configuration if applicable. Changing dashboard access and the hostname allowlist applies immediately without a service restart.
 
 Install/configure Skyscraper for the operating-system user running the server. The dashboard uses the same `-skyscraper`, `-source`, and `-timeout` options as CLI enrichment. If Skyscraper is missing or fails, uploaded ROMs remain available and the metadata job visibly fails; it can be retried after fixing the configuration. Avoid running separate CLI enrichment against the same platform while a dashboard job is active.
 
@@ -133,10 +164,17 @@ The metadata queue holds at most 32 pending jobs and 64 recent history entries, 
 
 ### Admin HTTP API
 
-All `/api/` routes require `Authorization: Bearer <admin-token>` (this is separate from device tokens). No CORS access is enabled. The static login page exposes no library data. The API is intended for administrators, not device clients:
+Except for status, first-run setup, and login, `/api/` routes require the dashboard session cookie in login mode; anonymous mode explicitly permits full access. No CORS access is enabled. Every mutating request requires **`X-Romsync-Request: 1`**, including login/setup and anonymous requests. Cross-site requests and mismatched browser origins are rejected. The static login page exposes no library data. This API is for administrators, not device clients:
 
 | Method | Route | Purpose |
 |--------|-------|---------|
+| GET | `/api/status` | Setup/login state and service readiness; setup defaults only on direct loopback before setup |
+| POST | `/api/setup` | One-time local setup with `settings`, `mode`, and optional `username`/`password` |
+| POST | `/api/login` | `username`/`password`; returns a dashboard session cookie |
+| POST | `/api/logout` | Invalidate the current session |
+| GET / PUT | `/api/settings` | Read configuration/status or save a complete settings object (no password hashes exposed) |
+| POST | `/api/auth` | Change `mode`, `username`, `password`; include `current_password` when login is enabled |
+| POST | `/api/restart` | Restart services using saved settings; returns HTTP 202 and target generation/address |
 | GET | `/api/library` | Games with metadata and asset IDs, platforms, and upload limit |
 | GET | `/api/devices` | Registered devices without token hashes |
 | POST | `/api/devices/{id}` | Approve/revoke with `{"approved":true}` |
@@ -201,13 +239,13 @@ wsl -d Ubuntu-24.04 --cd ~ -- nano .local/share/romsync/skyscraper/config.ini
 
 Under `[screenscraper]`, uncomment `userCreds` and replace its placeholder with your [ScreenScraper](https://www.screenscraper.fr/) username and password. Keep the value double-quoted and escape literal backslashes/double quotes as `\\`/`\"`. The config is mode `0600`; the server never receives these credentials as command-line arguments. Do not share that file or scraper logs that may contain account details.
 
-Keep your usual admin-token environment variable and add the WSL flag when starting the Windows server:
+In dashboard Settings, choose `Skyscraper` as the executable and `Ubuntu-24.04` as the WSL distribution, then save and restart services. Alternatively, use CLI overrides with a stable configuration file:
 
 ```powershell
-go run .\server\cmd\romsync-core serve -roms C:\roms -state .\data -web-listen 127.0.0.1:8080 -skyscraper-wsl Ubuntu-24.04
+go run .\server\cmd\romsync-core -config .\romsync.json -roms C:\roms -state .\data -skyscraper-wsl Ubuntu-24.04
 
 # Or perform one enrichment directly:
-go run .\server\cmd\romsync-core enrich -roms C:\roms -platform snes -skyscraper-wsl Ubuntu-24.04
+go run .\server\cmd\romsync-core enrich -config .\romsync.json -roms C:\roms -platform snes -skyscraper-wsl Ubuntu-24.04
 ```
 
 romsync translates Windows paths using `wslpath`, runs Skyscraper's gathering/export stages in the selected distribution, and converts exported Linux paths back into client-relative asset paths. `C:\roms` stays on Windows. The default executable resolves to the WSL user's `~/.local/bin/Skyscraper`; if overriding `-skyscraper` in WSL mode, supply the absolute **Linux** launcher path, not a Windows path. Run setup and romsync under the same Windows account and WSL default user. WSL is not used by native Linux servers.
@@ -289,9 +327,9 @@ tvOS catalogs allow only `nes`, `snes`, `gb`, `gbc`, `gba`, `megadrive`, `genesi
 
 The private state directory contains `devices/` (hashed tokens and approval), `saves/` (atomic current-save pointers), and `backups/` (immutable, timestamped save uploads). Files are synced before publication; directory changes are also synced on Linux (Windows does not support this through Go's directory handles). Incomplete or invalid uploads do not change the current pointer. A failure during final publication can have an uncertain outcome: reconcile using `CheckSaveState` before retrying. A crash between snapshot creation and pointer replacement can leave an unreferenced snapshot, which is deliberately retained. Back up the entire state directory; do not prune files referenced by current-save pointers. Run only one server process per state directory.
 
-See [server/deploy/nginx.conf](server/deploy/nginx.conf) and [server/deploy/romsync.service](server/deploy/romsync.service). Create a dedicated `romsync` service account, grant it read/write access to `/srv/romsync/roms` for uploads and enrichment, install the binary at `/usr/local/bin/romsync-core`, and adjust the example hostname/certificates. The systemd unit creates `/var/lib/romsync` and sets it as the service's `HOME` so Skyscraper can keep its configuration/cache there despite `ProtectHome=true`. Create `/etc/romsync/admin.env` containing `ROMSYNC_ADMIN_TOKEN=<your random token>`, owned by root with mode `0600`; systemd reads this file before starting the service. Configure Skyscraper using that home directory as the service user, not root.
+See [server/deploy/nginx.conf](server/deploy/nginx.conf) and [server/deploy/romsync.service](server/deploy/romsync.service). Create a dedicated `romsync` service account, grant it read/write access to `/srv/romsync/roms` for uploads and enrichment, install the binary at `/usr/local/bin/romsync-core`, and adjust the example hostname/certificates. The systemd unit creates `/var/lib/romsync`, stores configuration at `/var/lib/romsync/romsync.json`, and sets that directory as the service's `HOME` so Skyscraper can keep its configuration/cache there despite `ProtectHome=true`. Complete first-run setup through a loopback connection/SSH forward, choosing `/srv/romsync/roms` and your intended private state path. No admin-token environment file is required. Configure Skyscraper using that home directory as the service user, not root. If changing paths in Settings, also update the service's writable-path restrictions.
 
-Nginx routes `/` to the HTTP dashboard and the gRPC service paths to the gRPC listener. The dashboard location allows 2 GiB uploads with request buffering disabled; keep that limit aligned with `-max-rom-bytes`. Only Nginx's HTTPS port should be publicly reachable. For a read-only, gRPC-only deployment, remove `-web-listen` and `EnvironmentFile` from the unit, use `ReadOnlyPaths` for the ROM directory, and remove Nginx's dashboard location.
+Nginx routes `/` to the HTTP dashboard and the gRPC service paths to the gRPC listener. The dashboard location allows 2 GiB uploads with request buffering disabled; keep that limit aligned with the configured maximum ROM upload size. Only Nginx's HTTPS port should be publicly reachable. For device-only remote access, omit Nginx's dashboard location while keeping the dashboard bound to loopback for local administration.
 
 No client retry loop is needed inside the server: clients should reconnect streams with bounded exponential backoff and jitter after network failures. Save uploads require an explicit success response before the client updates its synchronized revision; an uncertain result should be reconciled with `CheckSaveState`.
 

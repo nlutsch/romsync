@@ -1,7 +1,12 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-let token = "";
+let signedIn = false;
+let sessionVersion = 0;
+let servicesReady = false;
+let accessMode = "";
+let restarting = false;
+let reconnectRequired = false;
 let library = { games: [], platforms: [], max_rom_bytes: 0 };
 let devices = [];
 let jobs = [];
@@ -34,15 +39,16 @@ function notify(message, error = false) {
   $("notice").hidden = false;
 }
 
-async function api(url, options = {}) {
+async function request(url, options = {}, lockOnUnauthorized = false) {
   const response = await fetch(url, {
     ...options,
-    headers: { ...options.headers, Authorization: `Bearer ${token}` },
+    headers: { "X-Romsync-Request": "1", ...options.headers },
+    credentials: "same-origin",
     cache: "no-store",
   });
-  if (response.status === 401) {
+  if (response.status === 401 && lockOnUnauthorized) {
     lock();
-    throw new Error("Session locked. Enter a valid admin token.");
+    throw new Error("Session expired. Sign in again.");
   }
   if (!response.ok) {
     const body = await response.json();
@@ -50,6 +56,8 @@ async function api(url, options = {}) {
   }
   return response;
 }
+
+function api(url, options = {}) { return request(url, options, true); }
 
 function post(url, data) {
   return api(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
@@ -61,14 +69,15 @@ function releaseImages() {
 }
 
 function lock() {
-  token = "";
+  signedIn = false;
+  sessionVersion++;
   library = { games: [], platforms: [], max_rom_bytes: 0 };
   devices = [];
   jobs = [];
   releaseImages();
   $("dashboard").hidden = true;
   $("login").hidden = false;
-  $("token").value = "";
+  $("password").value = "";
   selectedGameID = "";
   $("game-list").replaceChildren();
   $("game-detail").replaceChildren();
@@ -78,13 +87,13 @@ function lock() {
 }
 
 function switchTab(tab) {
-  for (const name of ["library", "devices", "jobs"]) $(`${name}-panel`).hidden = name !== tab;
+  for (const name of ["library", "devices", "jobs", "settings"]) $(`${name}-panel`).hidden = name !== tab;
   document.querySelectorAll("[data-tab]").forEach((button) => {
     button.classList.toggle("active", button.dataset.tab === tab);
     if (button.dataset.tab === tab) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   });
-  $("breadcrumb").textContent = { library: "Game library", devices: "Devices", jobs: "Metadata jobs" }[tab];
+  $("breadcrumb").textContent = { library: "Game library", devices: "Devices", jobs: "Metadata jobs", settings: "Settings" }[tab];
 }
 
 function updateSelect(select, values, all = false) {
@@ -96,12 +105,19 @@ function updateSelect(select, values, all = false) {
 }
 
 async function refresh() {
-  if (!token || refreshInFlight) return;
+  if (!signedIn || refreshInFlight || restarting || reconnectRequired) return;
   refreshInFlight = true;
-  const activeToken = token;
+  const activeSession = sessionVersion;
   try {
+    const status = await (await api("/api/status")).json();
+    if (!status.authenticated) { lock(); return; }
+    servicesReady = status.ready;
+    if (!servicesReady) {
+      notify(status.runtime_error || "Sync services are starting. Check Settings if this continues.", !!status.runtime_error);
+      return;
+    }
     const results = await Promise.all(["library", "devices", "jobs"].map(async (name) => (await api(`/api/${name}`)).json()));
-    if (!token || token !== activeToken) return;
+    if (!signedIn || sessionVersion !== activeSession) return;
     const changed = library.revision !== results[0].revision;
     [library, devices, jobs] = results;
     $("game-count").textContent = library.games.length.toLocaleString();
@@ -216,7 +232,7 @@ function selectGame(id) {
     api(`/api/media?id=${encodeURIComponent(game.image)}`)
         .then((response) => response.blob())
         .then((blob) => {
-          if (version !== viewVersion || !token) return;
+          if (version !== viewVersion || !signedIn) return;
           const url = URL.createObjectURL(blob);
           imageURLs.push(url);
           const img = node("img");
@@ -289,23 +305,22 @@ $("login-form").addEventListener("submit", async (event) => {
     $("login-error").textContent = "A previous request is finishing. Please try again.";
     return;
   }
-  token = $("token").value.trim();
   $("login-error").textContent = "";
-  const button = event.submitter;
+  const button = event.submitter || $("login-form").querySelector("button[type=submit]");
   button.disabled = true;
   try {
-    await refresh();
-    if (!token) return;
-    $("token").value = "";
-    $("login").hidden = true;
-    $("dashboard").hidden = false;
-    $("notice").hidden = true;
+    await request("/api/login", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({username:$("username").value,password:$("password").value})});
+    $("password").value = "";
+    await initialize();
   } catch (error) {
     lock();
     $("login-error").textContent = error.message;
   } finally { button.disabled = false; }
 });
-$("logout").addEventListener("click", lock);
+$("logout").addEventListener("click", async () => {
+  try { await post("/api/logout", {}); lock(); }
+  catch (error) { notify(error.message, true); }
+});
 document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
 document.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => {
   if (button.dataset.close === "upload-dialog" && uploading) return;
@@ -334,7 +349,7 @@ function uploadFile(file, platform, onProgress) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open("PUT", `/api/roms?platform=${encodeURIComponent(platform)}&name=${encodeURIComponent(file.name)}`);
-    request.setRequestHeader("Authorization", `Bearer ${token}`);
+    request.setRequestHeader("X-Romsync-Request", "1");
     request.setRequestHeader("Content-Type", "application/octet-stream");
     request.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(100 * event.loaded / event.total); };
     request.onerror = () => reject(new Error("Upload connection lost. Refresh the library before retrying; the file may have been stored."));
@@ -376,7 +391,7 @@ $("upload-form").addEventListener("submit", async (event) => {
     } catch (error) {
       failures++;
       results.push(`${file.name}: ${error.message}`);
-      if (!token) break;
+      if (!signedIn) break;
     }
   }
   uploading = false;
@@ -390,5 +405,191 @@ $("upload-form").addEventListener("submit", async (event) => {
 });
 $("upload-dialog").addEventListener("cancel", (event) => { if (uploading) event.preventDefault(); });
 setInterval(() => {
-  if (token && !document.hidden) refresh().catch((error) => notify(`Refresh failed: ${error.message}`, true));
+  if (signedIn && !document.hidden) refresh().catch((error) => notify(`Refresh failed: ${error.message}`, true));
 }, 5000);
+
+const settingsFields = [
+  ["rom_path","ROM directory","text","Existing folder containing platform subdirectories. No files are moved or deleted."],
+  ["state_path","Private state directory","text","Device approvals, saves, and backups. Must be outside the ROM directory; changing this does not migrate state."],
+  ["web_listen","Dashboard listen address","text","Loopback HTTP only, e.g. 127.0.0.1:8080. Use Nginx HTTPS for remote access."],
+  ["dashboard_url","Public dashboard HTTPS URL (optional)","url","For remote access through Nginx, e.g. https://romsync.example.com. This allowlists the dashboard hostname; direct loopback access always works."],
+  ["listen","Device gRPC listen address","text","Loopback without TLS; remote bindings require a certificate and key."],
+  ["tls_cert","TLS certificate path (optional)","text","Server-local PEM certificate path."],
+  ["tls_key","TLS private key path (optional)","text","Server-local PEM key path, outside the ROM directory."],
+  ["max_rom_bytes","Maximum ROM upload (bytes)","number","Default 2147483648 (2 GiB); maximum 1099511627776 (1 TiB)."],
+  ["max_save_bytes","Maximum save upload (bytes)","number","Default 67108864 (64 MiB); maximum 1 TiB."],
+  ["skyscraper","Skyscraper executable","text","Executable path or command; use Skyscraper for the default WSL launcher."],
+  ["skyscraper_wsl","WSL distribution (Windows only, optional)","text","For example Ubuntu-24.04. Leave empty on Linux."],
+  ["source","Metadata source","text","For example screenscraper. Scraper account credentials remain in its private configuration."],
+  ["timeout_seconds","Metadata timeout (seconds)","number","Default 1800 (30 minutes); maximum 86400 (24 hours)."],
+];
+
+function renderSettings(container, prefix, settings) {
+  $(container).replaceChildren();
+  for (const [name,label,type,help] of settingsFields) {
+    const wrap = node("div","settings-field");
+    const title = node("label","",label);
+    title.htmlFor = `${prefix}-${name}`;
+    const input = node("input");
+    input.id = title.htmlFor;
+    input.type = type;
+    input.value = settings[name] ?? "";
+    input.required = !["tls_cert","tls_key","skyscraper_wsl","dashboard_url"].includes(name);
+    if (type === "number") {
+      input.min = "1";
+      input.max = name === "timeout_seconds" ? "86400" : "1099511627776";
+      input.step = "1";
+    }
+    wrap.append(title,input,node("small","",help));
+    $(container).append(wrap);
+  }
+}
+
+function readSettings(prefix) {
+  return Object.fromEntries(settingsFields.map(([name,,type]) => [name,type === "number" ? Number($(`${prefix}-${name}`).value) : $(`${prefix}-${name}`).value]));
+}
+
+function toggleCredentials(prefix) {
+  const login = $(`${prefix}-mode`).value === "login";
+  $(`${prefix}-credentials`).hidden = !login;
+  $(`${prefix}-anonymous-warning`).hidden = login;
+  for (const name of ["username","password","confirm"]) $(`${prefix}-${name}`).required = login;
+}
+for (const prefix of ["setup","auth"]) $(`${prefix}-mode`).addEventListener("change",() => toggleCredentials(prefix));
+
+async function loadSettings() {
+  const view = await (await api("/api/settings")).json();
+  $("settings-error").textContent = $("auth-error").textContent = "";
+  renderSettings("server-settings","settings",view.settings);
+  $("config-path").textContent = `Configuration: ${view.config_path}`;
+  $("runtime-status").textContent = view.runtime_error || (view.restart_required ? "Saved settings are not active yet. Restart services to apply them." : "Services are using the saved settings.");
+  $("auth-mode").value = view.auth.mode;
+  $("auth-username").value = view.auth.username || "";
+  $("auth-password").value = $("auth-confirm").value = $("auth-current").value = "";
+  $("current-password-field").hidden = view.auth.mode !== "login";
+  $("auth-current").required = view.auth.mode === "login";
+  toggleCredentials("auth");
+}
+
+async function initialize() {
+  const status = await (await request("/api/status")).json();
+  $("setup").hidden = true;
+  $("login").hidden = true;
+  $("dashboard").hidden = true;
+  if (!status.configured) {
+    if (!status.local_setup) {
+      $("login").hidden = false;
+      $("login-error").textContent = "First-run setup must be completed directly on the server at its loopback dashboard URL.";
+      return;
+    }
+    renderSettings("setup-settings","setup",status.defaults);
+    $("setup").hidden = false;
+    return;
+  }
+  if (!status.authenticated) { lock(); return; }
+  signedIn = true;
+  sessionVersion++;
+  servicesReady = status.ready;
+  accessMode = status.mode;
+  $("dashboard").hidden = false;
+  $("logout").hidden = accessMode === "anonymous";
+  $("access-label").textContent = accessMode === "anonymous" ? "Anonymous administration" : "Signed in";
+  await loadSettings();
+  if (!servicesReady) switchTab("settings");
+  await refresh();
+}
+
+$("setup-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("setup-submit");
+  button.disabled = true;
+  $("setup-error").textContent = "";
+  try {
+    if ($("setup-mode").value === "login" && $("setup-password").value !== $("setup-confirm").value) throw new Error("Passwords do not match.");
+    const result = await (await request("/api/setup", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+      settings:readSettings("setup"),mode:$("setup-mode").value,username:$("setup-username").value,password:$("setup-password").value,
+    })})).json();
+    $("setup-password").value = $("setup-confirm").value = "";
+    $("setup-error").textContent = "Configuration saved. Starting services...";
+    if (await reconnect(result, $("setup-error"))) await initialize();
+  } catch (error) { $("setup-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+async function reconnect(result, message) {
+    const next = new URL(location.href);
+    if (["localhost","127.0.0.1","[::1]"].includes(next.hostname)) {
+      const address = new URL(`http://${result.web_listen}`);
+      if (address.port !== "0") next.port = address.port;
+    }
+    if (next.origin !== location.origin) {
+      reconnectRequired = true;
+      message.textContent = `Settings saved. Services are restarting. Open ${next.origin} to reconnect. If that address is unavailable, the server will keep the old dashboard address; refresh here and check Settings.`;
+      message.hidden = false;
+      const link = node("a","",`Open ${next.origin}`);
+      link.href = next.origin;
+      message.append(" ",link);
+      return false;
+    }
+    let status;
+    for (let attempt=0;attempt<60;attempt++) {
+      await new Promise(resolve=>setTimeout(resolve,500));
+      try {
+        status = await (await request("/api/status")).json();
+      } catch (error) {
+        if (attempt === 59) throw new Error(`Could not reconnect after restart: ${error.message}. Check the server console.`);
+        continue;
+      }
+      if (status.generation >= result.generation && !status.restarting) break;
+    }
+    if (!status || status.generation < result.generation) throw new Error("Restart is taking longer than expected. Check the server console and refresh.");
+    return true;
+}
+
+async function restartServices() {
+  if (restarting || !confirm("Restart services? Active transfers will disconnect, metadata jobs will be cancelled, and job history will be cleared.")) return;
+  restarting = true;
+  try {
+    const result = await (await post("/api/restart",{})).json();
+    notify("Restarting services...");
+    if (!await reconnect(result, $("notice"))) return;
+    restarting = false;
+    await initialize();
+    const status = await (await api("/api/status")).json();
+    notify(status.runtime_error || "Services restarted successfully.", !!status.runtime_error);
+  } finally { restarting = false; }
+}
+
+$("settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("settings-error").textContent = "";
+  const buttons = [...$("settings-form").querySelectorAll("button")];
+  buttons.forEach(button=>button.disabled=true);
+  try {
+    await api("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(readSettings("settings"))});
+    $("runtime-status").textContent = "Settings saved. Restart services to apply changes.";
+    notify("Configuration saved.");
+    if (event.submitter?.id === "save-restart") await restartServices();
+  } catch (error) { $("settings-error").textContent = error.message; }
+  finally { buttons.forEach(button=>button.disabled=false); }
+});
+$("restart-services").addEventListener("click",() => restartServices().catch(error=>notify(error.message,true)));
+$("auth-form").addEventListener("submit",async (event) => {
+  event.preventDefault();
+  event.submitter.disabled=true;
+  $("auth-error").textContent="";
+  try {
+    if ($("auth-mode").value==="login" && $("auth-password").value!==$("auth-confirm").value) throw new Error("Passwords do not match.");
+    await request("/api/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+      mode:$("auth-mode").value,username:$("auth-username").value,password:$("auth-password").value,current_password:$("auth-current").value,
+    })});
+    $("auth-password").value = $("auth-confirm").value = $("auth-current").value = "";
+    await initialize();
+  } catch(error) { $("auth-error").textContent=error.message; }
+  finally { event.submitter.disabled=false; }
+});
+
+initialize().catch(error=>{
+  $("login").hidden=false;
+  $("login-error").textContent=`Unable to load server status: ${error.message}. Refresh to retry.`;
+});

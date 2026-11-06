@@ -94,6 +94,20 @@ progress{width:100%;margin-top:20px;accent-color:var(--accent)}
 .login-card small{display:block}
 #login-error{color:#ffaaa0;font-size:.85rem}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.setup-card{max-width:900px}
+.settings-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 24px}
+.settings-field{min-width:0}
+.settings-field small{display:block;margin-top:8px}
+.settings-card{background:#141a25;border:1px solid var(--border);border-radius:14px;padding:28px;margin-bottom:24px}
+.settings-card>.actions{margin:28px 0 16px;flex-wrap:wrap}
+.settings-card>button{margin-top:24px}
+.settings-card>small{display:block}
+.settings-card>.muted{margin:20px 0 0}
+.access-warning{border:1px solid #635439;background:#29251d;color:#edcf9f;border-radius:8px;padding:16px;font-size:.85rem;line-height:1.6;overflow-wrap:anywhere}
+.form-error{color:#ffaaa0;font-size:.85rem;white-space:pre-line;overflow-wrap:anywhere;margin-top:16px}
+a{color:var(--accent)}
+code{overflow-wrap:anywhere}
+@media(max-width:800px){.settings-fields{grid-template-columns:1fr}.settings-card{padding:20px}}
 
 @media(min-width:1600px){.panel{max-width:1550px;margin:auto}
 }

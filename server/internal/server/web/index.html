@@ -9,17 +9,34 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <div id="login" class="login-shell">
+  <div id="setup" class="login-shell" hidden>
+    <form id="setup-form" class="login-card setup-card">
+      <div class="brand"><span class="brand-mark">r/</span>romsync</div>
+      <p class="eyebrow">WELCOME HOME</p><h1>Set up your server.</h1>
+      <p class="muted">Choose your ROM folder and dashboard access. Settings are saved beside the executable by default. Device approval is always required.</p>
+      <div id="setup-settings" class="settings-fields"></div>
+      <label for="setup-mode">Dashboard access</label><select id="setup-mode"><option value="login">Create a login (recommended)</option><option value="anonymous">Allow anonymous administration</option></select>
+      <div id="setup-credentials">
+        <label for="setup-username">Username</label><input id="setup-username" autocomplete="username" maxlength="128" required>
+        <label for="setup-password">Password</label><input id="setup-password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+        <label for="setup-confirm">Confirm password</label><input id="setup-confirm" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+      </div>
+      <p id="setup-anonymous-warning" class="access-warning" hidden>Anyone who can reach the dashboard will be able to upload ROMs, approve devices, change settings, and restart services. Do not expose anonymous access to untrusted networks.</p>
+      <button id="setup-submit" type="submit" class="primary">Save and start server</button>
+      <p id="setup-error" class="form-error" role="alert"></p>
+    </form>
+  </div>
+  <div id="login" class="login-shell" hidden>
     <form id="login-form" class="login-card">
       <div class="brand"><span class="brand-mark">r/</span>romsync</div>
       <p class="eyebrow">YOUR LIBRARY. EVERYWHERE.</p>
       <h1>Welcome to your<br>control room.</h1>
-      <p class="muted">One library, all your devices. Enter your admin token to manage your collection.</p>
-      <label for="token">Admin token</label>
-      <input id="token" type="password" autocomplete="off" required placeholder="Paste your admin token">
+      <p class="muted">One library, all your devices. Sign in to manage your collection.</p>
+      <label for="username">Username</label><input id="username" autocomplete="username" required>
+      <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" maxlength="1024" required>
       <button type="submit" class="primary">Open dashboard <span aria-hidden="true">&rarr;</span></button>
       <p id="login-error" role="alert"></p>
-      <small>Your token stays in this tab's memory, never in browser storage.</small>
+      <small>Forgot your password? Stop the server and run <code>romsync-core reset-password</code> on the server, then start it again.</small>
     </form>
   </div>
   <div id="dashboard" hidden>
@@ -30,8 +47,9 @@
         <button class="nav active" data-tab="library" aria-current="page"><span aria-hidden="true">&#9638;</span> Game library</button>
         <button class="nav" data-tab="devices"><span aria-hidden="true">&#9635;</span> Devices <span id="pending-badge" class="badge" hidden></span></button>
         <button class="nav" data-tab="jobs"><span aria-hidden="true">&#8635;</span> Metadata jobs</button>
+        <button class="nav" data-tab="settings"><span aria-hidden="true">&#9881;</span> Settings</button>
       </nav>
-      <div class="sidebar-bottom"><span class="connection">Connected to your server</span><button id="logout" class="quiet">Lock dashboard</button></div>
+      <div class="sidebar-bottom"><span id="access-label" class="connection">Connected to your server</span><button id="logout" class="quiet">Sign out</button></div>
     </aside>
     <main>
       <header class="topbar"><span>WORKSPACE <span class="slash">/</span> <span id="breadcrumb">Game library</span></span><button id="refresh" class="quiet">Refresh</button></header>
@@ -61,6 +79,30 @@
       <section id="jobs-panel" class="panel" hidden>
         <div class="page-heading"><div><p class="eyebrow">BEHIND THE SCENES</p><h1>Metadata jobs<span class="accent">.</span></h1><p class="muted">Artwork and game lists, prepared for every profile. One job runs at a time.</p></div><button id="jobs-sync" class="primary">Sync metadata</button></div>
         <div id="job-list" class="job-list"></div>
+      </section>
+      <section id="settings-panel" class="panel" hidden>
+        <div class="page-heading"><div><p class="eyebrow">MAKE IT YOURS</p><h1>Server settings<span class="accent">.</span></h1><p class="muted">Save configuration, then restart services to apply changes. Files are never moved or deleted.</p></div></div>
+        <p id="config-path" class="file-path"></p><p id="runtime-status" class="access-warning" role="status"></p>
+        <form id="settings-form" class="settings-card">
+          <div id="server-settings" class="settings-fields"></div>
+          <div class="actions"><button type="submit" class="primary">Save settings</button><button id="save-restart" type="submit">Save and restart services</button><button id="restart-services" type="button">Restart services</button></div>
+          <small>Restarting disconnects device streams and active uploads, cancels metadata jobs, and clears job history. Changing state folders does not migrate devices or saves. A different web port changes the dashboard URL; update your proxy if applicable.</small>
+          <p id="settings-error" class="form-error" role="alert"></p>
+        </form>
+        <form id="auth-form" class="settings-card">
+          <h2>Dashboard access</h2>
+          <label for="auth-mode">Access mode</label><select id="auth-mode"><option value="login">Username and password</option><option value="anonymous">Anonymous administration</option></select>
+          <p id="auth-anonymous-warning" class="access-warning" hidden>Anonymous users have full administrative access. Device synchronization still requires an approved device token.</p>
+          <div id="auth-credentials">
+            <label for="auth-username">Username</label><input id="auth-username" autocomplete="username" maxlength="128" required>
+            <label for="auth-password">New password</label><input id="auth-password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+            <label for="auth-confirm">Confirm new password</label><input id="auth-confirm" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+          </div>
+          <div id="current-password-field"><label for="auth-current">Current password</label><input id="auth-current" type="password" autocomplete="current-password"></div>
+          <button type="submit" class="primary">Update access</button>
+          <p class="muted">Access changes apply immediately and invalidate existing sessions. Passwords are stored only as salted hashes. For CLI recovery, stop the server, run <code>romsync-core reset-password</code>, then start it again.</p>
+          <p id="auth-error" class="form-error" role="alert"></p>
+        </form>
       </section>
       <footer>romsync <span>/</span> Local games. Seamless sessions.</footer>
     </main>

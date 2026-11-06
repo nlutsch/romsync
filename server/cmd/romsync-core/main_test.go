@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pb "github.com/nlutsch/romsync/gen/romsync/v1"
+	"github.com/nlutsch/romsync/server/internal/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	reflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
@@ -31,8 +32,9 @@ func TestServeLifecycle(t *testing.T) {
 	listener.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	configPath := lifecycleConfig(t, dir, roms)
 	go func() {
-		done <- run(ctx, []string{"serve", "-listen", address, "-roms", roms, "-state", filepath.Join(dir, "state")}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		done <- run(ctx, []string{"serve", "-config", configPath, "-listen", address, "-web-listen", "127.0.0.1:0"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	}()
 	defer func() {
 		cancel()
@@ -106,8 +108,22 @@ func TestInvalidOptions(t *testing.T) {
 	}
 }
 
+func lifecycleConfig(t *testing.T, dir, roms string) string {
+	t.Helper()
+	name := filepath.Join(dir, "romsync.json")
+	store, err := server.LoadConfig(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := server.DefaultSettings(dir)
+	settings.ROMPath = roms
+	if err := store.SaveAuth(server.DashboardAuth{Mode: "anonymous"}, true, &settings); err != nil {
+		t.Fatal(err)
+	}
+	return name
+}
+
 func TestAdminServeLifecycle(t *testing.T) {
-	t.Setenv("ROMSYNC_ADMIN_TOKEN", "test-only-lifecycle-admin-token-value")
 	dir := t.TempDir()
 	roms := filepath.Join(dir, "roms")
 	if err := os.Mkdir(roms, 0755); err != nil {
@@ -121,8 +137,9 @@ func TestAdminServeLifecycle(t *testing.T) {
 	listener.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	configPath := lifecycleConfig(t, dir, roms)
 	go func() {
-		done <- run(ctx, []string{"serve", "-listen", "127.0.0.1:0", "-web-listen", address, "-roms", roms, "-state", filepath.Join(dir, "state")}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		done <- run(ctx, []string{"serve", "-config", configPath, "-listen", "127.0.0.1:0", "-web-listen", address}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	}()
 	defer func() {
 		cancel()
@@ -150,7 +167,6 @@ func TestAdminServeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("ROMSYNC_ADMIN_TOKEN"))
 	response, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -164,10 +180,8 @@ func TestAdminServeLifecycle(t *testing.T) {
 func TestAdminListenValidation(t *testing.T) {
 	dir := t.TempDir()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for _, address := range []string{"0.0.0.0:8080", "not-an-address", "127.0.0.1:0"} {
-		// The loopback case must fail because no valid token is configured.
-		t.Setenv("ROMSYNC_ADMIN_TOKEN", "")
-		err := run(context.Background(), []string{"serve", "-roms", dir, "-state", filepath.Join(t.TempDir(), "state"), "-listen", "127.0.0.1:0", "-web-listen", address}, log)
+	for _, address := range []string{"0.0.0.0:8080", "not-an-address", ""} {
+		err := run(context.Background(), []string{"serve", "-config", filepath.Join(t.TempDir(), "romsync.json"), "-roms", dir, "-state", filepath.Join(t.TempDir(), "state"), "-listen", "127.0.0.1:0", "-web-listen", address}, log)
 		if err == nil {
 			t.Fatalf("invalid admin listener accepted: %s", address)
 		}
