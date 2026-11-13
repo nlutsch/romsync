@@ -93,6 +93,7 @@ function switchTab(tab) {
     if (button.dataset.tab === tab) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   });
+  if (tab === "jobs") $("job-list").querySelectorAll("details[open] pre").forEach(restoreJobOutput);
   $("breadcrumb").textContent = { library: "Game library", devices: "Devices", jobs: "Metadata jobs", settings: "Settings" }[tab];
 }
 
@@ -111,13 +112,19 @@ async function refresh() {
   try {
     const status = await (await api("/api/status")).json();
     if (!status.authenticated) { lock(); return; }
+    const wasReady = servicesReady;
     servicesReady = status.ready;
     if (!servicesReady) {
-      notify(status.runtime_error || "Sync services are starting. Check Settings if this continues.", !!status.runtime_error);
+      notify(status.runtime_error || "Indexing the ROM library: scanning folders and hashing files. Games will appear automatically when this finishes; large libraries can take time.", !!status.runtime_error);
+      if (!library.revision) {
+        for (const id of ["game-count","platform-count","device-count","library-size"]) $(id).textContent = status.runtime_error ? "Unavailable" : "Indexing";
+        $("game-list").replaceChildren(node("div","empty",status.runtime_error || "Your ROM library is being indexed. This is not an empty library; games will appear when the scan finishes."));
+      }
       return;
     }
     const results = await Promise.all(["library", "devices", "jobs"].map(async (name) => (await api(`/api/${name}`)).json()));
     if (!signedIn || sessionVersion !== activeSession) return;
+    const wasIndexing = !!library.indexing;
     const changed = library.revision !== results[0].revision;
     [library, devices, jobs] = results;
     $("game-count").textContent = library.games.length.toLocaleString();
@@ -132,9 +139,17 @@ async function refresh() {
     updateSelect($("sync-platform"), library.platforms);
     $("platforms").replaceChildren(...library.platforms.map((p) => new Option(p, p)));
     $("upload-limit").textContent = `Maximum ${size(library.max_rom_bytes)} per file. ZIP/7z files stay archived.`;
-    if (changed || !$("game-list").childElementCount) renderGames(true);
+    if (library.indexing) {
+      for (const id of ["game-count","platform-count","library-size"]) $(id).textContent = "Indexing";
+      $("game-list").replaceChildren(node("div","empty",library.scan_error || "Your ROM library is being indexed. Systems will appear as their scans finish."));
+      notify(library.scan_error || "Scanning the ROM library in the background.", !!library.scan_error);
+    } else {
+      if (changed || !$("game-list").childElementCount) renderGames(true);
+      if (library.scan_error) notify(library.scan_error, true);
+    }
     renderDevices();
     renderJobs();
+    if ((!wasReady || wasIndexing) && !library.indexing && !library.scan_error) notify("ROM library ready.");
   } finally {
     refreshInFlight = false;
   }
@@ -172,10 +187,10 @@ function renderGames(preserveSelection = false) {
     row.addEventListener("click",() => { selectGame(game.id); $("game-list").focus({preventScroll:true}); });
     $("game-list").append(row);
   }
-  selectGame(selectedGameID);
+  selectGame(selectedGameID, preserveSelection);
 }
 
-function selectGame(id) {
+function selectGame(id, preservePosition = false) {
   selectedGameID = id;
   for (const row of $("game-list").querySelectorAll('[role="option"]')) {
     const active = row.dataset.gameId === id;
@@ -192,6 +207,8 @@ function selectGame(id) {
   releaseImages();
   const version = viewVersion;
   const detail = $("game-detail");
+  const previousScroll = preservePosition && detail.dataset.gameId === id ? detail.scrollTop : 0;
+  detail.dataset.gameId = id;
   detail.replaceChildren();
   const game = filteredGames.find((item) => item.id === id);
   if (!game) {
@@ -205,7 +222,7 @@ function selectGame(id) {
   art.append(placeholder,node("span","platform-pill",game.platform.toUpperCase()));
   content.append(art);
   const text = node("div","detail-text");
-  text.append(node("p","eyebrow","NOW EXPLORING"),node("h2","",game.title));
+  text.append(node("p","eyebrow","NOW EXPLORING"),node("h2","",game.title),node("p","detail-filename",game.id.split("/").slice(1).join("/")));
   const metadata = game.metadata || {};
   const description = node("p","game-description",metadata.desc || "No description yet. Sync metadata for this platform to discover more about this game.");
   text.append(description);
@@ -228,6 +245,7 @@ function selectGame(id) {
   text.append(badges,node("p","file-path",game.id),node("code","checksum",`SHA-256 ${game.sha256}`));
   content.append(text);
   detail.append(content);
+  detail.scrollTop = previousScroll;
   if (game.image) {
     api(`/api/media?id=${encodeURIComponent(game.image)}`)
         .then((response) => response.blob())
@@ -278,25 +296,65 @@ function renderDevices() {
   }
 }
 
+function restoreJobOutput(output) {
+  output.scrollTop = output.dataset.followBottom === "true" ? output.scrollHeight : Number(output.dataset.scrollTop);
+}
+
 function renderJobs() {
-  const expanded = new Set([...$("job-list").querySelectorAll("details[open]")].map((el) => el.dataset.id));
-  $("job-list").replaceChildren();
-  if (!jobs.length) $("job-list").append(node("div", "empty", "No metadata jobs yet. Queue a sync or upload a ROM to get started."));
-  for (const job of jobs) {
-    const card = node("article", "job-card");
-    const top = node("div", "job-top");
-    top.append(node("h3", "", `${job.platform.toUpperCase()} metadata`), node("span", `status ${job.status}`, job.status.toUpperCase()));
-    const time = node("time", "", new Date(job.created).toLocaleString());
-    time.dateTime = job.created;
-    card.append(top, time);
-    if (job.error) card.append(node("p", "job-error", job.error));
-    const details = node("details");
-    details.dataset.id = job.id;
-    details.open = expanded.has(job.id);
-    details.append(node("summary", "", "View job output"), node("pre", "", job.log || "Waiting for scraper output..."));
-    card.append(details);
-    $("job-list").append(card);
+  const list = $("job-list");
+  const existing = new Map([...list.querySelectorAll(".job-card")].map((card) => [card.dataset.id, card]));
+  if (!jobs.length) {
+    list.replaceChildren(node("div", "empty", "No metadata jobs yet. Queue a sync or upload a ROM to get started."));
+    return;
   }
+  list.querySelector(".empty")?.remove();
+  for (const [index, job] of jobs.entries()) {
+    let card = existing.get(job.id);
+    if (!card) {
+      card = node("article", "job-card");
+      card.dataset.id = job.id;
+      const top = node("div", "job-top");
+      top.append(node("h3"), node("span", "status"));
+      const details = node("details");
+      details.dataset.id = job.id;
+      const output = node("pre");
+      output.dataset.followBottom = "true";
+      output.dataset.scrollTop = "0";
+      output.addEventListener("scroll", () => {
+        if (!output.clientHeight) return;
+        output.dataset.followBottom = String(output.scrollHeight - output.clientHeight - output.scrollTop <= 8);
+        output.dataset.scrollTop = String(output.scrollTop);
+      });
+      details.addEventListener("toggle", () => {
+        if (details.open) restoreJobOutput(output);
+      });
+      details.append(node("summary", "", "View job output"), output);
+      card.append(top, node("time"), node("p", "job-error"), details);
+    }
+    existing.delete(job.id);
+    if (list.children[index] !== card) list.insertBefore(card, list.children[index] || null);
+    card.querySelector("h3").textContent = `${job.platform.toUpperCase()} metadata`;
+    const status = card.querySelector(".status");
+    status.className = `status ${job.status}`;
+    status.textContent = job.status.toUpperCase();
+    const time = card.querySelector("time");
+    time.textContent = new Date(job.created).toLocaleString();
+    time.dateTime = job.created;
+    const error = card.querySelector(".job-error");
+    error.hidden = !job.error;
+    error.textContent = job.error || "";
+    const output = card.querySelector("pre");
+    const text = job.log || "Waiting for scraper output...";
+    if (output.textContent !== text) {
+      const follow = output.clientHeight ? output.scrollHeight - output.clientHeight - output.scrollTop <= 8 : output.dataset.followBottom === "true";
+      const position = output.clientHeight ? output.scrollTop : Number(output.dataset.scrollTop);
+      output.textContent = text;
+      output.dataset.followBottom = String(follow);
+      output.dataset.scrollTop = String(position);
+      if (output.clientHeight) output.scrollTop = follow ? output.scrollHeight : position;
+    }
+  }
+  existing.forEach((card) => card.remove());
 }
 
 $("login-form").addEventListener("submit", async (event) => {
@@ -411,9 +469,8 @@ setInterval(() => {
 const settingsFields = [
   ["rom_path","ROM directory","text","Existing folder containing platform subdirectories. No files are moved or deleted."],
   ["state_path","Private state directory","text","Device approvals, saves, and backups. Must be outside the ROM directory; changing this does not migrate state."],
-  ["web_listen","Dashboard listen address","text","Loopback HTTP only, e.g. 127.0.0.1:8080. Use Nginx HTTPS for remote access."],
-  ["dashboard_url","Public dashboard HTTPS URL (optional)","url","For remote access through Nginx, e.g. https://romsync.example.com. This allowlists the dashboard hostname; direct loopback access always works."],
-  ["listen","Device gRPC listen address","text","Loopback without TLS; remote bindings require a certificate and key."],
+  ["web_listen","Dashboard listen address","text","Default 0.0.0.0:18777 accepts connections on all IPv4 interfaces. Use your firewall and reverse proxy to control network access."],
+  ["listen","Device gRPC listen address","text","Default 0.0.0.0:7777 accepts connections on all IPv4 interfaces. TLS is optional when a reverse proxy terminates HTTPS."],
   ["tls_cert","TLS certificate path (optional)","text","Server-local PEM certificate path."],
   ["tls_key","TLS private key path (optional)","text","Server-local PEM key path, outside the ROM directory."],
   ["max_rom_bytes","Maximum ROM upload (bytes)","number","Default 2147483648 (2 GiB); maximum 1099511627776 (1 TiB)."],
@@ -434,16 +491,94 @@ function renderSettings(container, prefix, settings) {
     input.id = title.htmlFor;
     input.type = type;
     input.value = settings[name] ?? "";
-    input.required = !["tls_cert","tls_key","skyscraper_wsl","dashboard_url"].includes(name);
+    input.required = !["tls_cert","tls_key","skyscraper_wsl"].includes(name);
     if (type === "number") {
       input.min = "1";
       input.max = name === "timeout_seconds" ? "86400" : "1099511627776";
       input.step = "1";
     }
-    wrap.append(title,input,node("small","",help));
+    wrap.append(title);
+    if (name === "rom_path") {
+      const picker = node("div","path-picker");
+      const browse = node("button","folder-browse");
+      browse.type = "button";
+      browse.title = "Browse server";
+      browse.setAttribute("aria-label","Browse server");
+      const icon = document.createElementNS("http://www.w3.org/2000/svg","svg");
+      icon.setAttribute("viewBox","0 0 24 24");
+      icon.setAttribute("fill","none");
+      icon.setAttribute("stroke","currentColor");
+      icon.setAttribute("stroke-width","1.8");
+      icon.setAttribute("aria-hidden","true");
+      const outline = document.createElementNS("http://www.w3.org/2000/svg","path");
+      outline.setAttribute("d","M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z");
+      icon.append(outline);
+      browse.append(icon);
+      browse.addEventListener("click", () => {
+        directoryTarget = input;
+        $("directory-dialog").showModal();
+        browseDirectory(input.value);
+      });
+      picker.append(input,browse);
+      wrap.append(picker);
+    } else {
+      wrap.append(input);
+    }
+    wrap.append(node("small","",help));
     $(container).append(wrap);
   }
 }
+
+let directoryTarget = null;
+let directoryCurrent = "";
+let directoryParent = "";
+let directoryVersion = 0;
+
+async function browseDirectory(path) {
+  const version = ++directoryVersion;
+  $("directory-error").textContent = "";
+  $("directory-list").replaceChildren();
+  $("directory-list").setAttribute("aria-busy","true");
+  $("directory-select").disabled = $("directory-up").disabled = true;
+  $("directory-path").value = path;
+  try {
+    const listing = await (await request(`/api/directories?${new URLSearchParams({path})}`, {}, signedIn)).json();
+    if (version !== directoryVersion) return;
+    directoryCurrent = listing.path;
+    directoryParent = listing.parent;
+    $("directory-path").value = listing.path;
+    for (const folder of listing.directories) {
+      const button = node("button","",folder.name);
+      button.type = "button";
+      button.addEventListener("click", () => browseDirectory(folder.path));
+      $("directory-list").append(button);
+    }
+    if (!listing.directories.length) $("directory-list").append(node("p","muted","No subdirectories."));
+    $("directory-select").disabled = false;
+    $("directory-up").disabled = !directoryParent;
+  } catch (error) {
+    if (version === directoryVersion) $("directory-error").textContent = error.message;
+  } finally {
+    if (version === directoryVersion) $("directory-list").setAttribute("aria-busy","false");
+  }
+}
+
+$("directory-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  browseDirectory($("directory-path").value);
+});
+$("directory-path").addEventListener("input", () => { $("directory-select").disabled = true; });
+$("directory-up").addEventListener("click", () => browseDirectory(directoryParent));
+$("directory-select").addEventListener("click", () => {
+  if (!directoryTarget) return;
+  directoryTarget.value = directoryCurrent;
+  directoryTarget.dispatchEvent(new Event("input", {bubbles:true}));
+  $("directory-dialog").close();
+});
+$("directory-dialog").addEventListener("close", () => {
+  directoryVersion++;
+  directoryTarget = null;
+});
 
 function readSettings(prefix) {
   return Object.fromEntries(settingsFields.map(([name,,type]) => [name,type === "number" ? Number($(`${prefix}-${name}`).value) : $(`${prefix}-${name}`).value]));
@@ -462,7 +597,7 @@ async function loadSettings() {
   $("settings-error").textContent = $("auth-error").textContent = "";
   renderSettings("server-settings","settings",view.settings);
   $("config-path").textContent = `Configuration: ${view.config_path}`;
-  $("runtime-status").textContent = view.runtime_error || (view.restart_required ? "Saved settings are not active yet. Restart services to apply them." : "Services are using the saved settings.");
+  $("runtime-status").textContent = view.runtime_error || (!servicesReady ? "Sync services are starting. The ROM library is being indexed." : view.restart_required ? "Saved settings are not active yet. Restart services to apply them." : "Services are using the saved settings.");
   $("auth-mode").value = view.auth.mode;
   $("auth-username").value = view.auth.username || "";
   $("auth-password").value = $("auth-confirm").value = $("auth-current").value = "";
@@ -477,11 +612,6 @@ async function initialize() {
   $("login").hidden = true;
   $("dashboard").hidden = true;
   if (!status.configured) {
-    if (!status.local_setup) {
-      $("login").hidden = false;
-      $("login-error").textContent = "First-run setup must be completed directly on the server at its loopback dashboard URL.";
-      return;
-    }
     renderSettings("setup-settings","setup",status.defaults);
     $("setup").hidden = false;
     return;
@@ -518,7 +648,7 @@ $("setup-form").addEventListener("submit", async (event) => {
 
 async function reconnect(result, message) {
     const next = new URL(location.href);
-    if (["localhost","127.0.0.1","[::1]"].includes(next.hostname)) {
+    if (next.protocol === "http:") {
       const address = new URL(`http://${result.web_listen}`);
       if (address.port !== "0") next.port = address.port;
     }

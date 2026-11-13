@@ -13,7 +13,7 @@
     <form id="setup-form" class="login-card setup-card">
       <div class="brand"><span class="brand-mark">r/</span>romsync</div>
       <p class="eyebrow">WELCOME HOME</p><h1>Set up your server.</h1>
-      <p class="muted">Choose your ROM folder and dashboard access. Settings are saved beside the executable by default. Device approval is always required.</p>
+      <p class="muted">Choose your ROM folder and dashboard access. Settings are saved to romsync.json in the current working directory by default. Device approval is always required.</p>
       <div id="setup-settings" class="settings-fields"></div>
       <label for="setup-mode">Dashboard access</label><select id="setup-mode"><option value="login">Create a login (recommended)</option><option value="anonymous">Allow anonymous administration</option></select>
       <div id="setup-credentials">
@@ -107,6 +107,18 @@
       <footer>romsync <span>/</span> Local games. Seamless sessions.</footer>
     </main>
   </div>
+  <dialog id="directory-dialog" aria-labelledby="directory-title">
+    <div class="dialog-heading"><h2 id="directory-title">Choose a server directory</h2><button type="button" class="close" data-close="directory-dialog" aria-label="Close directory browser">&times;</button></div>
+    <p class="muted">These folders are on the romsync server, not this browser's computer. Only folders accessible to the server process can be browsed.</p>
+    <form id="directory-form">
+      <label for="directory-path">Server path</label>
+      <div class="path-picker"><input id="directory-path" type="text"><button type="submit">Go</button></div>
+    </form>
+    <button id="directory-up" type="button">Up one folder</button>
+    <div id="directory-list" aria-label="Server folders" aria-busy="false"></div>
+    <p id="directory-error" class="form-error" role="alert"></p>
+    <button id="directory-select" type="button" class="primary" disabled>Use this directory</button>
+  </dialog>
   <dialog id="upload-dialog">
     <form id="upload-form">
       <div class="dialog-heading"><h2>Add to your collection</h2><button type="button" class="close" data-close="upload-dialog" aria-label="Close upload dialog">&times;</button></div>

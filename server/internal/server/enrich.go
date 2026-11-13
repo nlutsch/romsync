@@ -49,6 +49,7 @@ type ScraperOptions struct {
 	Binary          string
 	Source          string
 	WSLDistribution string
+	progress        func(game)
 }
 
 func wslOutput(ctx context.Context, distribution string, args ...string) (string, error) {
@@ -69,18 +70,13 @@ func wslOutput(ctx context.Context, distribution string, args ...string) (string
 // Enrich gathers metadata, exports an EmulationStation game list, and builds profile assets.
 // Credentials and scraper-specific settings stay in Skyscraper's own configuration.
 func Enrich(ctx context.Context, romPath, platform string, options ScraperOptions, output io.Writer) error {
-	if platform == "" || strings.ContainsAny(platform, `/\.`) {
-		return fmt.Errorf("platform must be a single directory name without dots")
-	}
 	root, err := os.OpenRoot(romPath)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
-	if !validPlatform(platform) || platform == generatedDir {
-		return fmt.Errorf("invalid or reserved platform")
-	}
-	if _, err := root.Stat(platform); err != nil {
+	platform, physical, err := resolvePlatform(root, platform)
+	if err != nil {
 		return err
 	}
 	if err := root.MkdirAll(filepath.Join(generatedDir, platform, ".enrichment", "media"), 0755); err != nil {
@@ -91,10 +87,15 @@ func Enrich(ctx context.Context, romPath, platform string, options ScraperOption
 		return err
 	}
 	defer dir.Close()
+	romDir, err := root.OpenRoot(physical)
+	if err != nil {
+		return err
+	}
+	defer romDir.Close()
 	if err := dir.MkdirAll(".enrichment/media", 0700); err != nil {
 		return err
 	}
-	abs, err := filepath.Abs(filepath.Join(romPath, platform))
+	abs, err := filepath.Abs(filepath.Join(romPath, physical))
 	if err != nil {
 		return err
 	}
@@ -176,6 +177,11 @@ func Enrich(ctx context.Context, romPath, platform string, options ScraperOption
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("Skyscraper failed: %w", err)
 		}
+		if index == 1 && options.progress != nil {
+			if err := previewMetadata(dir, romDir, abs, scrapeRoot, options.progress); err != nil {
+				return err
+			}
+		}
 	}
 	if err := mergeLogos(dir, abs, scrapeRoot, dataAbs, scrapeData); err != nil {
 		return err
@@ -183,16 +189,50 @@ func Enrich(ctx context.Context, romPath, platform string, options ScraperOption
 	if _, err := fmt.Fprintln(output, "Generating Batocera, Miyoo, and tvOS profiles..."); err != nil {
 		return err
 	}
-	romDir, err := root.OpenRoot(platform)
-	if err != nil {
-		return err
-	}
-	defer romDir.Close()
-	if err := buildProfiles(ctx, dir, romDir, abs, scrapeRoot, dataAbs, scrapeData); err != nil {
+	if err := buildProfiles(ctx, dir, romDir, abs, scrapeRoot, dataAbs, scrapeData, options.progress); err != nil {
 		return err
 	}
 	_, err = fmt.Fprintln(output, "Metadata and artwork ready.")
 	return err
+}
+
+func textualMetadata(elements []element) []element {
+	var text []element
+	for _, e := range elements {
+		switch e.XMLName.Local {
+		case "video", "marquee", "fanart", "wheel", "boxart", "texture", "boxback", "screenshot":
+			continue
+		}
+		text = append(text, e)
+	}
+	return text
+}
+
+func previewMetadata(dir, romDir *os.Root, abs, scrapeRoot string, publish func(game)) error {
+	file, err := dir.Open(filepath.Join(".enrichment", "gamelist.xml"))
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	var list gameList
+	if err := xml.NewDecoder(io.LimitReader(file, 32<<20)).Decode(&list); err != nil {
+		return fmt.Errorf("parse metadata preview: %w", err)
+	}
+	for _, g := range list.Games {
+		rom, err := relativeScraperAsset(abs, scrapeRoot, g.Path)
+		if err != nil {
+			return err
+		}
+		info, err := romDir.Stat(rom)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("preview game is not a regular file: %s", rom)
+		}
+		publish(game{Path: "./" + filepath.ToSlash(rom), Name: g.Name, Other: textualMetadata(g.Other)})
+	}
+	return nil
 }
 
 // ES exporters may replace marquees with wheel logos. Pegasus preserves both types.
@@ -279,7 +319,7 @@ func mergeLogos(dir *os.Root, abs, scrapeRoot, dataAbs, scrapeData string) error
 	return atomicBytes(dir, filepath.Join(".enrichment", "gamelist.xml"), data)
 }
 
-func buildProfiles(ctx context.Context, dir, romDir *os.Root, abs, scrapeRoot, dataAbs, scrapeData string) error {
+func buildProfiles(ctx context.Context, dir, romDir *os.Root, abs, scrapeRoot, dataAbs, scrapeData string, publish func(game)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -376,15 +416,11 @@ func buildProfiles(ctx context.Context, dir, romDir *os.Root, abs, scrapeRoot, d
 				}
 				*asset.field = "./" + filepath.ToSlash(dest)
 			}
-			// Other textual metadata is retained; scraper-specific artwork paths are not portable.
-			for _, e := range originalGame.Other {
-				switch e.XMLName.Local {
-				case "video", "marquee", "fanart", "wheel", "boxart", "texture", "boxback", "screenshot":
-					continue
-				}
-				g.Other = append(g.Other, e)
-			}
+			g.Other = textualMetadata(originalGame.Other)
 			result.Games = append(result.Games, g)
+			if profile.name == "batocera" && publish != nil {
+				publish(g)
+			}
 		}
 		data, err := xml.MarshalIndent(result, "", "  ")
 		if err != nil {

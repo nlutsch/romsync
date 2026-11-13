@@ -6,9 +6,10 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -129,34 +130,6 @@ func (c *Control) authorized(r *http.Request, auth DashboardAuth) bool {
 	return ok && s.auth == auth && time.Now().Before(s.expires)
 }
 
-func directLocalSetup(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	ip := net.ParseIP(host)
-	if err != nil || ip == nil || !ip.IsLoopback() {
-		return false
-	}
-	host, _, err = net.SplitHostPort(r.Host)
-	if err != nil {
-		host = r.Host
-	}
-	ip = net.ParseIP(host)
-	return (host == "localhost" || (ip != nil && ip.IsLoopback())) &&
-		r.Header.Get("Forwarded") == "" && r.Header.Get("X-Forwarded-For") == "" && r.Header.Get("X-Forwarded-Proto") == ""
-}
-
-func dashboardHostAllowed(r *http.Request, settings Settings) bool {
-	host := r.Host
-	if name, _, err := net.SplitHostPort(host); err == nil {
-		host = name
-	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	if host == "localhost" || (ip != nil && ip.IsLoopback()) {
-		return true
-	}
-	public, err := url.Parse(settings.DashboardURL)
-	return err == nil && public.Host != "" && strings.EqualFold(r.Host, public.Host)
-}
-
 func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
@@ -169,11 +142,6 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		c.static.ServeHTTP(w, r)
-		return
-	}
-	// Explicit hosts prevent DNS rebinding against a loopback anonymous dashboard.
-	if !dashboardHostAllowed(r, c.store.Snapshot().Settings) {
-		c.fail(w, http.StatusForbidden, "dashboard hostname is not configured; set the public HTTPS URL through the loopback dashboard")
 		return
 	}
 	if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
@@ -199,6 +167,18 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	auth := c.store.Snapshot().Auth
+	if r.Method == http.MethodGet && r.URL.Path == "/api/directories" {
+		if auth.Mode != "" && !c.authorized(r, auth) {
+			c.fail(w, http.StatusUnauthorized, "dashboard login required")
+			return
+		}
+		if r.Header.Get("X-Romsync-Request") != "1" {
+			c.fail(w, http.StatusForbidden, "X-Romsync-Request: 1 header required")
+			return
+		}
+		c.directories(w, r)
+		return
+	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/status":
 		c.mu.RLock()
@@ -206,11 +186,11 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.mu.RUnlock()
 		status := map[string]any{"configured": auth.Mode != "", "mode": auth.Mode,
 			"authenticated": c.authorized(r, auth), "ready": ready, "restarting": busy,
-			"local_setup": directLocalSetup(r), "generation": generation}
+			"generation": generation}
 		if c.authorized(r, auth) {
 			status["runtime_error"] = lastErr
 		}
-		if auth.Mode == "" && directLocalSetup(r) {
+		if auth.Mode == "" {
 			status["defaults"] = c.store.Snapshot().Settings
 		}
 		c.json(w, http.StatusOK, status)
@@ -307,6 +287,53 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (c *Control) directories(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(filepath.Dir(c.store.Path()), path)
+	}
+	path = filepath.Clean(path)
+	info, err := os.Stat(path)
+	if err == nil && !info.IsDir() {
+		c.fail(w, http.StatusBadRequest, "path must be a directory")
+		return
+	}
+	var entries []os.DirEntry
+	if err == nil {
+		entries, err = os.ReadDir(path)
+	}
+	if err != nil {
+		c.log.Error("directory browsing failed", "path", path, "error", err)
+		code := http.StatusInternalServerError
+		if errors.Is(err, fs.ErrNotExist) {
+			code = http.StatusNotFound
+		} else if errors.Is(err, fs.ErrPermission) {
+			code = http.StatusForbidden
+		}
+		c.fail(w, code, err.Error())
+		return
+	}
+	type directory struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+	dirs := make([]directory, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, directory{Name: entry.Name(), Path: filepath.Join(path, entry.Name())})
+		}
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		parent = ""
+	}
+	c.json(w, http.StatusOK, struct {
+		Path        string      `json:"path"`
+		Parent      string      `json:"parent"`
+		Directories []directory `json:"directories"`
+	}{path, parent, dirs})
+}
+
 func requestedAuth(mode, username, password string) (DashboardAuth, error) {
 	if mode == "anonymous" {
 		return DashboardAuth{Mode: mode}, nil
@@ -318,10 +345,6 @@ func requestedAuth(mode, username, password string) (DashboardAuth, error) {
 }
 
 func (c *Control) setup(w http.ResponseWriter, r *http.Request) {
-	if !directLocalSetup(r) {
-		c.fail(w, http.StatusForbidden, "complete first-run setup directly on this server using its loopback dashboard URL")
-		return
-	}
 	if c.store.Snapshot().Auth.Mode != "" {
 		c.fail(w, http.StatusConflict, "setup has already been completed")
 		return

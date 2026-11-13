@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,80 +24,169 @@ import (
 )
 
 func (s *Server) Scan() error {
+	return s.scan(context.Background())
+}
+
+type scanReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (r scanReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.Reader.Read(p)
+}
+
+func (s *Server) scan(ctx context.Context) (result error) {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
+	defer func() {
+		s.catalogMu.Lock()
+		defer s.catalogMu.Unlock()
+		s.scanError = ""
+		if result != nil {
+			s.scanError = result.Error()
+		}
+	}()
+	previousFiles := s.cache.Files
+	previousSystems := make(map[string]bool)
+	for _, entry := range s.cache.Catalog.Entries {
+		if entry.Kind == "rom" {
+			previousSystems[entry.Platform] = true
+		}
+	}
+	cold := s.cache.Catalog.Revision == ""
 	catalog := &pb.Catalog{}
 	hash := sha256.New()
-	err := fs.WalkDir(s.roms.FS(), ".", func(name string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if name != "." && strings.HasPrefix(d.Name(), ".") {
-			if d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		parts := strings.Split(name, "/")
-		if len(parts) < 2 {
-			return nil
-		}
-		generated := parts[0] == generatedDir
-		id, platform, kind := name, parts[0], "rom"
-		assetType := pb.AssetType_ASSET_UNSPECIFIED
-		target := strings.Join(parts[1:], "/")
-		if generated {
-			// Publish only generated manifests and profile assets, never raw exports/cache.
-			if len(parts) < 3 {
-				return nil
-			}
-			id, platform = strings.Join(parts[1:], "/"), parts[1]
-			switch {
-			case len(parts) == 3 && (parts[2] == "gamelist.xml" || parts[2] == "miyoogamelist.xml" || parts[2] == "tvosgamelist.xml"):
-				kind, target = "metadata", parts[2]
-			case len(parts) == 6 && parts[2] == "media" && assetTypeFor(parts[4]) != pb.AssetType_ASSET_UNSPECIFIED:
-				kind, target, assetType = "media", strings.Join(parts[2:], "/"), assetTypeFor(parts[4])
-			default:
-				return nil
-			}
-		} else {
-			if strings.HasSuffix(strings.ToLower(name), ".xml") || (len(parts) > 2 && parts[1] == "media") {
-				return nil
-			}
-		}
-		f, err := s.roms.Open(filepath.FromSlash(name))
-		if err != nil {
-			return err
-		}
-		h := sha256.New()
-		size, err := io.Copy(h, f)
-		closeErr := f.Close()
-		if err != nil {
-			return err
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		entry := &pb.CatalogEntry{Id: id, Platform: platform, Title: strings.TrimSuffix(path.Base(name), path.Ext(name)), Size: size, Sha256: hex.EncodeToString(h.Sum(nil)), Kind: kind, AssetType: assetType, TargetPath: target}
-		catalog.Entries = append(catalog.Entries, entry)
-		fmt.Fprintf(hash, "%s\x00%s\x00%d\x00", name, entry.Sha256, size)
-		return nil
-	})
+	folders, err := platformFolders(s.roms)
 	if err != nil {
 		return fmt.Errorf("scan catalog: %w", err)
+	}
+	files := make(map[string]catalogFile)
+	paths := make(map[string]string)
+	scanDirectory := func(directory, canonical string) error {
+		return fs.WalkDir(s.roms.FS(), directory, func(name string, d fs.DirEntry, err error) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err != nil {
+				return err
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			if name != "." && strings.HasPrefix(d.Name(), ".") {
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+			parts := strings.Split(name, "/")
+			if len(parts) < 2 {
+				return nil
+			}
+			generated := parts[0] == generatedDir
+			id, platform, kind := path.Join(canonical, strings.Join(parts[1:], "/")), canonical, "rom"
+			assetType := pb.AssetType_ASSET_UNSPECIFIED
+			target := strings.Join(parts[1:], "/")
+			if generated {
+				// Publish only generated manifests and profile assets, never raw exports/cache.
+				if len(parts) < 3 {
+					return nil
+				}
+				id, platform = path.Join(canonical, strings.Join(parts[2:], "/")), canonical
+				switch {
+				case len(parts) == 3 && (parts[2] == "gamelist.xml" || parts[2] == "miyoogamelist.xml" || parts[2] == "tvosgamelist.xml"):
+					kind, target = "metadata", parts[2]
+				case len(parts) == 6 && parts[2] == "media" && assetTypeFor(parts[4]) != pb.AssetType_ASSET_UNSPECIFIED:
+					kind, target, assetType = "media", strings.Join(parts[2:], "/"), assetTypeFor(parts[4])
+				default:
+					return nil
+				}
+			} else {
+				if strings.HasSuffix(strings.ToLower(name), ".xml") || (len(parts) > 2 && parts[1] == "media") {
+					return nil
+				}
+			}
+			cached, unchanged := previousFiles[name]
+			unchanged = unchanged && cached.Size == info.Size() && cached.ModTime == info.ModTime().UnixNano()
+			if !unchanged {
+				f, err := s.roms.Open(filepath.FromSlash(name))
+				if err != nil {
+					return err
+				}
+				h := sha256.New()
+				size, readErr := io.Copy(h, scanReader{ctx, f})
+				after, statErr := f.Stat()
+				closeErr := f.Close()
+				if err := errors.Join(readErr, statErr, closeErr); err != nil {
+					return err
+				}
+				if size != info.Size() || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+					return fmt.Errorf("file %q changed during hashing; retry scan", name)
+				}
+				cached = catalogFile{Size: size, ModTime: info.ModTime().UnixNano(), SHA256: hex.EncodeToString(h.Sum(nil))}
+			}
+			files[name] = cached
+			paths[id] = name
+			entry := &pb.CatalogEntry{Id: id, Platform: platform, Title: strings.TrimSuffix(path.Base(name), path.Ext(name)), Size: cached.Size, Sha256: cached.SHA256, Kind: kind, AssetType: assetType, TargetPath: target}
+			catalog.Entries = append(catalog.Entries, entry)
+			fmt.Fprintf(hash, "%s\x00%s\x00%d\x00", id, entry.Sha256, entry.Size)
+			return nil
+		})
+	}
+	platforms := make([]string, 0, len(folders))
+	for platform := range folders {
+		platforms = append(platforms, platform)
+	}
+	sort.Strings(platforms)
+	for _, platform := range platforms {
+		start := len(catalog.Entries)
+		if err := scanDirectory(folders[platform], platform); err != nil {
+			return fmt.Errorf("scan %s: %w", platform, err)
+		}
+		if cold && len(catalog.Entries) > start {
+			partial := &pb.Catalog{Revision: hex.EncodeToString(hash.Sum(nil)), Entries: append([]*pb.CatalogEntry(nil), catalog.Entries...)}
+			if err := s.persistCatalog(partial, maps.Clone(files), maps.Clone(paths)); err != nil {
+				return err
+			}
+		}
+		if s.onPlatformScanned != nil && (len(catalog.Entries) > start || previousSystems[platform] || s.cache.Metadata[platform] != "") {
+			revision := romRevision(catalog.Entries[start:])
+			s.onPlatformScanned(platform, revision, s.cache.Metadata[platform])
+		}
+	}
+	generatedFolders, err := fs.ReadDir(s.roms.FS(), generatedDir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("scan generated catalog: %w", err)
+	}
+	for _, folder := range generatedFolders {
+		if !folder.IsDir() || strings.HasPrefix(folder.Name(), ".") {
+			continue
+		}
+		platform, err := canonicalPlatform(folder.Name())
+		if err != nil {
+			return err
+		}
+		if platform != folder.Name() {
+			s.log.Warn("ignoring legacy generated metadata directory; rerun metadata sync", "directory", folder.Name(), "platform", platform)
+			continue
+		}
+		if err := scanDirectory(path.Join(generatedDir, platform), platform); err != nil {
+			return fmt.Errorf("scan generated %s: %w", platform, err)
+		}
 	}
 	romIDs := map[string]string{}
 	for _, entry := range catalog.Entries {
@@ -108,15 +200,20 @@ func (s *Server) Scan() error {
 		}
 	}
 	catalog.Revision = hex.EncodeToString(hash.Sum(nil))
-	s.catalogMu.Lock()
-	defer s.catalogMu.Unlock()
-	if s.catalog == nil || s.catalog.Revision != catalog.Revision {
-		s.catalog = catalog
-		close(s.changed)
-		s.changed = make(chan struct{})
-		s.log.Info("catalog updated", "entries", len(catalog.Entries), "revision", catalog.Revision)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return nil
+	return s.persistCatalog(catalog, files, paths)
+}
+
+func romRevision(entries []*pb.CatalogEntry) string {
+	hash := sha256.New()
+	for _, entry := range entries {
+		if entry.Kind == "rom" {
+			fmt.Fprintf(hash, "%s\x00%s\x00%d\x00", entry.Id, entry.Sha256, entry.Size)
+		}
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func allowedPlatform(platform string, profile pb.Profile) bool {
@@ -208,7 +305,7 @@ func (s *Server) DownloadFile(req *pb.DownloadFileRequest, stream grpc.ServerStr
 		}
 		return nil
 	}
-	f, err := s.roms.Open(catalogPhysicalPath(entry))
+	f, err := s.roms.Open(s.physicalPath(entry))
 	if err != nil {
 		return s.internal(err)
 	}
@@ -263,6 +360,13 @@ func (s *Server) Watch(ctx context.Context) error {
 	if err := addDirs(); err != nil {
 		return err
 	}
+	s.log.Info("reconciling ROM library in background")
+	if err := s.scan(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		s.log.Error("initial catalog reconciliation failed; will retry", "error", err)
+	}
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	debounce := time.NewTimer(time.Hour)
@@ -288,14 +392,14 @@ func (s *Server) Watch(ctx context.Context) error {
 			if err := addDirs(); err != nil {
 				s.log.Error("watch directories", "error", err)
 			}
-			if err := s.Scan(); err != nil {
+			if err := s.scan(ctx); err != nil {
 				s.log.Error("catalog scan failed", "error", err)
 			}
 		case <-ticker.C:
 			if err := addDirs(); err != nil {
 				s.log.Error("watch directories", "error", err)
 			}
-			if err := s.Scan(); err != nil {
+			if err := s.scan(ctx); err != nil {
 				s.log.Error("catalog reconciliation failed", "error", err)
 			}
 		}

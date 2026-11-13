@@ -469,7 +469,7 @@ func TestProfileImages(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, ".composite", "gamelist.xml"), []byte(xmlData), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := buildProfiles(context.Background(), root, root, base, base, base, base); err != nil {
+	if err := buildProfiles(context.Background(), root, root, base, base, base, base, nil); err != nil {
 		t.Fatal(err)
 	}
 	files, err := os.ReadDir(filepath.Join(base, "media", "miyoo", "composite"))

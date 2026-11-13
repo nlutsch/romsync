@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -180,11 +182,92 @@ func TestAdminLibraryAndApproval(t *testing.T) {
 	}
 }
 
+func TestAdminMetadataPreviews(t *testing.T) {
+	f := setup(t, 1024)
+	filename := "Pretty Game (USA) [!].rom"
+	gameID := "snes/" + filename
+	if err := os.WriteFile(filepath.Join(f.roms, "snes", filename), []byte("ROM"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seedAssets(t, f)
+	a := setupAdmin(t, f, 1024)
+	type libraryView struct {
+		Revision string      `json:"revision"`
+		Games    []adminGame `json:"games"`
+	}
+	readLibrary := func() libraryView {
+		return decodeResponse[libraryView](t, adminRequest(t, a, http.MethodGet, "/api/library", ""), http.StatusOK)
+	}
+	findGame := func(view libraryView) adminGame {
+		for _, g := range view.Games {
+			if g.ID == gameID {
+				return g
+			}
+		}
+		t.Fatal("game disappeared from the library")
+		return adminGame{}
+	}
+	initial := readLibrary()
+	catalogRevision := f.s.catalog.Revision
+	if findGame(initial).Title != "Pretty Game" {
+		t.Fatal("ROM filename flags were not cleaned")
+	}
+	preview := game{Path: "./" + filename, Name: "A Proper Title (Director's Cut) [!]",
+		Other: []element{{XMLName: xml.Name{Local: "desc"}, Value: "Already fetched &amp; ready"}}}
+	a.publishPreview("snes", preview)
+	text := readLibrary()
+	g := findGame(text)
+	if text.Revision == initial.Revision || g.Title != "A Proper Title (Director's Cut)" || g.Metadata["desc"] != "Already fetched & ready" || g.Image != "" {
+		t.Fatalf("text preview was not published independently: %+v", g)
+	}
+	source := filepath.Join(f.roms, generatedDir, "snes", "media", "batocera", "composite", digest("game.rom")+".png")
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview.Image = "./media/batocera/composite/" + digest(filename) + ".png"
+	imageID := path.Join("snes", preview.Image)
+	destination := filepath.Join(f.roms, generatedDir, filepath.FromSlash(imageID))
+	if err := os.WriteFile(destination, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	target := "/api/media?id=" + url.QueryEscape(imageID)
+	if w := adminRequest(t, a, http.MethodGet, target, ""); w.Code != http.StatusNotFound {
+		t.Fatal("uncataloged, unpublished image was accessible")
+	}
+	a.publishPreview("snes", preview)
+	artwork := readLibrary()
+	g = findGame(artwork)
+	if artwork.Revision == text.Revision || g.Image != imageID || g.Assets["composite"] != imageID {
+		t.Fatalf("completed game artwork not published: %+v", g)
+	}
+	w := adminRequest(t, a, http.MethodGet, target, "")
+	if w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), data) {
+		t.Fatal("published artwork could not be downloaded before catalog scanning")
+	}
+	if w := adminRequest(t, a, http.MethodGet, "/api/media?id=snes/.enrichment/image.png", ""); w.Code != http.StatusNotFound {
+		t.Fatal("private scraper output was exposed")
+	}
+	if f.s.catalog.Revision != catalogRevision {
+		t.Fatal("preview required a catalog scan")
+	}
+	a.clearPreviews("snes")
+	if findGame(readLibrary()).Title != "Pretty Game" {
+		t.Fatal("preview did not clear")
+	}
+	if w := adminRequest(t, a, http.MethodGet, target, ""); w.Code != http.StatusNotFound {
+		t.Fatal("cleared preview retained image access")
+	}
+}
+
 func TestAdminUploadAndAutomaticEnrichment(t *testing.T) {
 	t.Setenv("ROMSYNC_TEST_SCRAPER", "1")
 	f := setup(t, 1024)
 	a := setupAdmin(t, f, 1024)
-	w := adminRequest(t, a, http.MethodPut, "/api/roms?platform=snes&name=game.sfc", "test ROM")
+	if err := os.Rename(filepath.Join(f.roms, "snes"), filepath.Join(f.roms, "SFC")); err != nil {
+		t.Fatal(err)
+	}
+	w := adminRequest(t, a, http.MethodPut, "/api/roms?platform=SNES&name=game.sfc", "test ROM")
 	uploaded := decodeResponse[struct {
 		ID       string      `json:"id"`
 		Job      MetadataJob `json:"job"`
@@ -197,7 +280,7 @@ func TestAdminUploadAndAutomaticEnrichment(t *testing.T) {
 	if jobs[0].Status != "succeeded" {
 		t.Fatalf("enrichment failed: %+v", jobs[0])
 	}
-	if data, err := os.ReadFile(filepath.Join(f.roms, "snes", "game.sfc")); err != nil || string(data) != "test ROM" {
+	if data, err := os.ReadFile(filepath.Join(f.roms, "SFC", "game.sfc")); err != nil || string(data) != "test ROM" {
 		t.Fatalf("upload missing: %s %v", data, err)
 	}
 	w = adminRequest(t, a, http.MethodGet, "/api/library", "")
@@ -224,13 +307,103 @@ func TestAdminUploadAndAutomaticEnrichment(t *testing.T) {
 	if w.Code != http.StatusConflict {
 		t.Fatalf("duplicate accepted: %d", w.Code)
 	}
-	data, err := os.ReadFile(filepath.Join(f.roms, "snes", "game.sfc"))
+	data, err := os.ReadFile(filepath.Join(f.roms, "SFC", "game.sfc"))
 	if err != nil || string(data) != "test ROM" {
 		t.Fatal("original ROM replaced")
 	}
-	decodeResponse[MetadataJob](t, adminRequest(t, a, http.MethodPost, "/api/jobs", `{"platform":"snes"}`), http.StatusAccepted)
+	decodeResponse[MetadataJob](t, adminRequest(t, a, http.MethodPost, "/api/jobs", `{"platform":"sfc"}`), http.StatusAccepted)
 	if jobs := waitJobs(t, a); jobs[0].Status != "succeeded" {
 		t.Fatalf("manual enrichment: %+v", jobs)
+	}
+}
+
+func TestAutomaticMetadataAfterSystemScans(t *testing.T) {
+	t.Setenv("ROMSYNC_TEST_SCRAPER", "1")
+	f := setup(t, 1024)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	t.Cleanup(cancel)
+	f.ctx = ctx
+	for _, platform := range []string{"snes", "ps2"} {
+		if err := os.WriteFile(filepath.Join(f.roms, platform, "game.sfc"), []byte("test scraper ROM"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := setupAdmin(t, f, 1024)
+	if err := f.s.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	jobs := waitJobs(t, a)
+	if len(jobs) != 2 {
+		t.Fatalf("expected one job per system: %+v", jobs)
+	}
+	for _, job := range jobs {
+		if job.Status != "succeeded" {
+			t.Fatalf("automatic enrichment failed: %+v", job)
+		}
+	}
+	filename := filepath.Join(f.roms, generatedDir, "snes", "gamelist.xml")
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, append(data, '\n'), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := f.s.Scan(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(a.jobs.snapshot()) != 2 {
+		t.Fatal("unchanged ROMs/generated-only changes retriggered metadata")
+	}
+	if err := os.WriteFile(filepath.Join(f.roms, "snes", "game.rom"), []byte("changed ROM contents"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	jobs = waitJobs(t, a)
+	if len(jobs) != 3 || jobs[0].Platform != "snes" || jobs[0].Status != "succeeded" {
+		t.Fatalf("changed system did not receive exactly one new job: %+v", jobs)
+	}
+	reopened, err := NewCachedContext(f.ctx, f.roms, f.state, 1024, f.s.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewAdmin(f.ctx, reopened, AdminOptions{Control: a.control, MaxROMBytes: 1024, Skyscraper: binary, Source: "screenscraper", Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if err := reopened.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.jobs.snapshot()) != 0 {
+		t.Fatal("successful metadata completion was lost on restart")
+	}
+	for _, name := range []string{"game.rom", "game.sfc"} {
+		if err := os.Remove(filepath.Join(f.roms, "snes", name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.s.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	jobs = waitJobs(t, a)
+	if len(jobs) != 4 || jobs[0].Platform != "snes" || jobs[0].Status != "failed" {
+		t.Fatalf("empty system change or scraper failure was not reported: %+v", jobs)
+	}
+	if err := f.s.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.jobs.snapshot()) != 4 {
+		t.Fatal("unchanged failed job was automatically retried")
 	}
 }
 
@@ -242,7 +415,7 @@ func TestAdminUploadValidation(t *testing.T) {
 		code         int
 	}{
 		{"/api/roms?platform=../outside&name=game.sfc", "ROM", 400},
-		{"/api/roms?platform=SFC&name=game.sfc", "ROM", 400},
+		{"/api/roms?platform=romsync-data&name=game.sfc", "ROM", 400},
 		{"/api/roms?platform=snes&name=..%2Fescape.sfc", "ROM", 400},
 		{"/api/roms?platform=snes&name=bad%5Cescape.sfc", "ROM", 400},
 		{"/api/roms?platform=snes&name=gamelist.xml", "ROM", 400},

@@ -5,7 +5,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,54 @@ func newTestControl(t *testing.T) (*Control, *ConfigStore, Settings) {
 	}
 	c.SetRuntime(nil, settings, nil)
 	return c, store, settings
+}
+
+func TestHostDirectoryBrowsing(t *testing.T) {
+	c, store, settings := newTestControl(t)
+	r := httptest.NewRequest("GET", "/api/directories", nil)
+	w := httptest.NewRecorder()
+	c.ServeHTTP(w, r)
+	decodeResponse[map[string]string](t, w, 403)
+	base := filepath.Dir(store.Path())
+	if err := os.WriteFile(filepath.Join(base, "not-a-directory"), []byte("ignored"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	type listing struct {
+		Path        string `json:"path"`
+		Parent      string `json:"parent"`
+		Directories []struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		} `json:"directories"`
+	}
+	result := decodeResponse[listing](t, controlRequest(c, "GET", "/api/directories", "", nil), 200)
+	if result.Path != base || result.Parent != filepath.Dir(base) || len(result.Directories) != 1 ||
+		result.Directories[0].Name != "roms" || result.Directories[0].Path != settings.ROMPath {
+		t.Fatalf("incorrect host directory listing: %+v", result)
+	}
+	empty := decodeResponse[listing](t, controlRequest(c, "GET", "/api/directories?path=roms", "", nil), 200)
+	if empty.Path != settings.ROMPath || empty.Directories == nil || len(empty.Directories) != 0 {
+		t.Fatalf("incorrect empty directory listing: %+v", empty)
+	}
+	decodeResponse[map[string]string](t, controlRequest(c, "GET", "/api/directories?path=missing", "", nil), 404)
+	decodeResponse[map[string]string](t, controlRequest(c, "GET", "/api/directories?path=not-a-directory", "", nil), 400)
+
+	root := filepath.VolumeName(base) + string(os.PathSeparator)
+	atRoot := decodeResponse[listing](t, controlRequest(c, "GET", "/api/directories?path="+url.QueryEscape(root), "", nil), 200)
+	if atRoot.Parent != "" {
+		t.Fatal("filesystem root must not have a parent")
+	}
+	auth, err := MakeLogin("admin", "long-test-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuth(auth, true, &settings); err != nil {
+		t.Fatal(err)
+	}
+	decodeResponse[map[string]string](t, controlRequest(c, "GET", "/api/directories", "", nil), 401)
+	login := controlRequest(c, "POST", "/api/login", `{"username":"admin","password":"long-test-password"}`, nil)
+	decodeResponse[map[string]bool](t, login, 200)
+	decodeResponse[listing](t, controlRequest(c, "GET", "/api/directories", "", login.Result().Cookies()[0]), 200)
 }
 
 func TestFirstRunLoginAndSessions(t *testing.T) {
@@ -101,22 +151,6 @@ func TestAnonymousSettingsAndAuthChanges(t *testing.T) {
 
 func TestDashboardRequestBoundaries(t *testing.T) {
 	c, store, settings := newTestControl(t)
-	for _, mutate := range []func(*http.Request){
-		func(r *http.Request) { r.RemoteAddr = "192.0.2.1:123" },
-		func(r *http.Request) { r.Host = "attacker.example" },
-		func(r *http.Request) { r.Header.Set("X-Forwarded-Proto", "https") },
-		func(r *http.Request) { r.Header.Set("X-Forwarded-For", "192.0.2.1") },
-	} {
-		r := httptest.NewRequest("POST", "http://127.0.0.1:8080/api/setup", strings.NewReader(`{}`))
-		r.RemoteAddr = "127.0.0.1:1234"
-		r.Header.Set("X-Romsync-Request", "1")
-		mutate(r)
-		w := httptest.NewRecorder()
-		c.ServeHTTP(w, r)
-		if w.Code != 403 {
-			t.Fatalf("nonlocal setup allowed: %d", w.Code)
-		}
-	}
 	if err := store.SaveAuth(DashboardAuth{Mode: "anonymous"}, true, &settings); err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +171,26 @@ func TestDashboardRequestBoundaries(t *testing.T) {
 	for _, body := range []string{`{"bad":1}`, `{} {}`, strings.Repeat("x", 17000)} {
 		decodeResponse[map[string]string](t, controlRequest(c, "PUT", "/api/settings", body, nil), 400)
 	}
+}
+
+func TestRemoteFirstRunSetup(t *testing.T) {
+	c, _, settings := newTestControl(t)
+	r := httptest.NewRequest("GET", "http://server.example:18777/api/status", nil)
+	r.RemoteAddr = "192.0.2.10:1234"
+	w := httptest.NewRecorder()
+	c.ServeHTTP(w, r)
+	status := decodeResponse[map[string]any](t, w, 200)
+	if status["defaults"] == nil {
+		t.Fatal("remote setup defaults missing")
+	}
+	body := jsonBody(t, map[string]any{"settings": settings, "mode": "anonymous"})
+	r = httptest.NewRequest("POST", "https://dashboard.example/api/setup", strings.NewReader(body))
+	r.RemoteAddr = "192.0.2.10:1234"
+	r.Header.Set("X-Romsync-Request", "1")
+	r.Header.Set("Origin", "https://dashboard.example")
+	w = httptest.NewRecorder()
+	c.ServeHTTP(w, r)
+	decodeResponse[map[string]any](t, w, 201)
 }
 
 func TestSessionsExpireAndProcessRestartInvalidates(t *testing.T) {
@@ -169,21 +223,16 @@ func TestSessionsExpireAndProcessRestartInvalidates(t *testing.T) {
 
 func TestPublicDashboardHostAndProxyOrigin(t *testing.T) {
 	c, store, settings := newTestControl(t)
-	settings.DashboardURL = "https://romsync.example:8443"
 	if err := store.SaveAuth(DashboardAuth{Mode: "anonymous"}, true, &settings); err != nil {
 		t.Fatal(err)
 	}
-	for _, host := range []string{"romsync.example:8443", "attacker.example", "romsync.example:9443"} {
+	for _, host := range []string{"192.0.2.1:18777", "server.example:18777", "another.example", "romsync.example:8443", "romsync.example:9443"} {
 		r := httptest.NewRequest("GET", "http://127.0.0.1/api/settings", nil)
 		r.Host = host
 		w := httptest.NewRecorder()
 		c.ServeHTTP(w, r)
-		expected := http.StatusForbidden
-		if host == "romsync.example:8443" {
-			expected = http.StatusOK
-		}
-		if w.Code != expected {
-			t.Fatalf("host %s returned %d want %d", host, w.Code, expected)
+		if w.Code != http.StatusOK {
+			t.Fatalf("host %s returned %d", host, w.Code)
 		}
 	}
 	r := httptest.NewRequest("PUT", "http://127.0.0.1/api/settings", strings.NewReader(jsonBody(t, settings)))
@@ -194,11 +243,18 @@ func TestPublicDashboardHostAndProxyOrigin(t *testing.T) {
 	w := httptest.NewRecorder()
 	c.ServeHTTP(w, r)
 	decodeResponse[map[string]bool](t, w, 200)
+
+	r = httptest.NewRequest("PUT", "http://192.0.2.1:18777/api/settings", strings.NewReader(jsonBody(t, settings)))
+	r.Host = "server.example:18777"
+	r.Header.Set("X-Romsync-Request", "1")
+	r.Header.Set("Origin", "http://server.example:18777")
+	w = httptest.NewRecorder()
+	c.ServeHTTP(w, r)
+	decodeResponse[map[string]bool](t, w, 200)
 }
 
 func TestLoginRateLimitAndSecureCookie(t *testing.T) {
 	c, store, settings := newTestControl(t)
-	settings.DashboardURL = "https://romsync.example"
 	auth, err := MakeLogin("admin", "long-test-password")
 	if err != nil {
 		t.Fatal(err)

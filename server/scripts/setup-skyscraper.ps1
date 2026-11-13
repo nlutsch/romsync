@@ -44,4 +44,4 @@ Write-Host 'Keep romsync native on Windows and add this flag to your usual serve
 Write-Host "  -skyscraper-wsl $Distribution"
 Write-Host ''
 Write-Host 'Example:'
-Write-Host "  go run .\server\cmd\romsync-core serve -roms C:\roms -state .\data -web-listen 127.0.0.1:8080 -skyscraper-wsl $Distribution"
+Write-Host "  go run .\server\cmd\romsync-core serve -roms C:\roms -state .\data -web-listen 127.0.0.1:18777 -skyscraper-wsl $Distribution"

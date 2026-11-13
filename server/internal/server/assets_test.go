@@ -66,7 +66,7 @@ func seedAssets(t *testing.T, f *fixture) {
 	}
 	defer romRoot.Close()
 	romAbs := filepath.Join(f.roms, "snes")
-	if err := buildProfiles(context.Background(), root, romRoot, romAbs, romAbs, base, base); err != nil {
+	if err := buildProfiles(context.Background(), root, romRoot, romAbs, romAbs, base, base, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.s.Scan(); err != nil {

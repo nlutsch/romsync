@@ -63,11 +63,8 @@ func TestConfigurationPersistenceAndValidation(t *testing.T) {
 		func(s *Settings) { s.StatePath = filepath.Join(s.ROMPath, "state") },
 		func(s *Settings) { s.StatePath = "" },
 		func(s *Settings) { s.ROMPath = filepath.Dir(store.Path()) },
-		func(s *Settings) { s.WebListen = "0.0.0.0:8080" },
 		func(s *Settings) { s.WebListen = "127.0.0.1:bad" },
-		func(s *Settings) { s.DashboardURL = "http://romsync.example" },
-		func(s *Settings) { s.DashboardURL = "https://romsync.example/path" },
-		func(s *Settings) { s.Listen = "0.0.0.0:7777" },
+		func(s *Settings) { s.Listen = "0.0.0.0:65536" },
 		func(s *Settings) { s.TLSCert = "missing.pem" },
 		func(s *Settings) { s.MaxROMBytes = 0 },
 		func(s *Settings) { s.MaxSaveBytes = 1 << 41 },
@@ -97,6 +94,13 @@ func TestConfigurationPersistenceAndValidation(t *testing.T) {
 	}
 	if reloaded.Snapshot().Settings.ROMPath != settings.ROMPath || !filepath.IsAbs(reloaded.Snapshot().Settings.StatePath) {
 		t.Fatal("relative paths are not config-relative")
+	}
+	for _, address := range []string{"0.0.0.0", "192.0.2.1", "server.example", "[::]"} {
+		open := settings
+		open.WebListen, open.Listen = address+":18777", address+":7777"
+		if err := ValidateSettings(&open, store.Path(), true); err != nil {
+			t.Fatalf("listener %s rejected: %v", address, err)
+		}
 	}
 }
 

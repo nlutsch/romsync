@@ -126,7 +126,7 @@ func (s *Server) deviceCatalog(c *pb.Catalog, profile pb.Profile, selection *pb.
 		if entry.Kind != "metadata" {
 			continue
 		}
-		f, err := s.roms.Open(catalogPhysicalPath(entry))
+		f, err := s.roms.Open(s.physicalPath(entry))
 		if err != nil {
 			return nil, nil, err
 		}

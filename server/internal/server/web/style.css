@@ -80,6 +80,13 @@ dialog::backdrop{background:#050810c9;backdrop-filter:blur(5px)}
 .dialog-heading{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}
 .dialog-heading h2{margin:0}
 .close{padding:2px 8px;background:transparent;border:0;font-size:1.6rem;color:var(--muted)}
+.path-picker{display:flex;gap:8px}
+.path-picker input{min-width:0}
+.folder-browse{display:grid;place-items:center;flex-shrink:0;padding:10px}
+.folder-browse svg{width:22px;height:22px}
+#directory-up{margin:16px 0}
+#directory-list{display:grid;gap:8px;max-height:35vh;overflow:auto}
+#directory-list button{text-align:left;overflow-wrap:anywhere}
 dialog .primary{width:100%;margin-top:22px}
 dialog input[type=file]{font-size:.8rem}
 dialog small{display:block;margin-top:8px}
@@ -165,7 +172,8 @@ main{margin-left:0}
 .detail-art{height:250px;display:flex;align-items:center;justify-content:center;position:relative;background:radial-gradient(ellipse at 30% 0%,#34453d,#171e2a 75%);border-bottom:1px solid var(--border)}
 .detail-art img{height:100%;width:100%;object-fit:contain}
 .detail-text{padding:26px}
-.detail-text h2{font-size:1.75rem;line-height:1.25;overflow-wrap:anywhere;margin-bottom:18px}
+.detail-text h2{font-size:1.75rem;line-height:1.25;overflow-wrap:anywhere;margin-bottom:6px}
+.detail-filename{font-size:.7rem;color:var(--muted);overflow-wrap:anywhere;margin-bottom:18px}
 .game-description{color:#b4bdce;font-size:.85rem;line-height:1.85;white-space:pre-line}
 .game-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:26px 0}
 .game-facts dt{color:var(--muted);font-size:.65rem;text-transform:uppercase;letter-spacing:1px}

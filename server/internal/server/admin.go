@@ -9,13 +9,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -36,11 +37,24 @@ type AdminOptions struct {
 }
 
 type Admin struct {
-	server  *Server
-	control *Control
-	maxROM  int64
-	jobs    *jobQueue
-	handler http.Handler
+	server         *Server
+	control        *Control
+	maxROM         int64
+	jobs           *jobQueue
+	handler        http.Handler
+	metadataMu     sync.Mutex
+	scanRevisions  map[string]string
+	attempts       map[string]metadataAttempt
+	source         string
+	previewMu      sync.RWMutex
+	previews       map[string]game
+	previewAssets  map[string]bool
+	previewVersion uint64
+}
+
+type metadataAttempt struct {
+	revision string
+	job      MetadataJob
 }
 
 func NewAdmin(ctx context.Context, s *Server, options AdminOptions) (*Admin, error) {
@@ -53,25 +67,39 @@ func NewAdmin(ctx context.Context, s *Server, options AdminOptions) (*Admin, err
 	if options.Timeout <= 0 || options.Skyscraper == "" || options.Source == "" {
 		return nil, fmt.Errorf("metadata timeout, executable and source are required")
 	}
-	a := &Admin{server: s, control: options.Control, maxROM: options.MaxROMBytes}
+	a := &Admin{server: s, control: options.Control, maxROM: options.MaxROMBytes,
+		scanRevisions: make(map[string]string), attempts: make(map[string]metadataAttempt), source: options.Source,
+		previews: make(map[string]game), previewAssets: make(map[string]bool)}
 	a.jobs = newJobQueue(ctx, func(ctx context.Context, platform string, out io.Writer) error {
 		ctx, cancel := context.WithTimeout(ctx, options.Timeout)
 		defer cancel()
+		a.metadataMu.Lock()
+		revision := a.scanRevisions[platform]
+		a.metadataMu.Unlock()
+		a.clearPreviews(platform)
 		s.log.Info("metadata job started", "platform", platform)
-		err := Enrich(ctx, s.roms.Name(), platform, ScraperOptions{Binary: options.Skyscraper, Source: options.Source, WSLDistribution: options.WSLDistribution}, out)
+		err := Enrich(ctx, s.roms.Name(), platform, ScraperOptions{Binary: options.Skyscraper, Source: options.Source, WSLDistribution: options.WSLDistribution,
+			progress: func(g game) { a.publishPreview(platform, g) }}, out)
 		if ctx.Err() != nil {
 			s.log.Error("metadata job cancelled", "platform", platform, "error", ctx.Err())
 			return errors.Join(err, ctx.Err())
 		}
-		scanErr := s.Scan()
+		scanErr := s.scan(ctx)
 		err = errors.Join(err, scanErr)
+		if err == nil && revision != "" {
+			err = s.markMetadata(platform, digest(revision+"\x00"+options.Source))
+		}
 		if err != nil {
 			s.log.Error("metadata job failed", "platform", platform, "error", err)
 		} else {
+			a.clearPreviews(platform)
 			s.log.Info("metadata job completed", "platform", platform)
 		}
 		return err
 	})
+	s.scanMu.Lock()
+	s.onPlatformScanned = a.platformScanned
+	s.scanMu.Unlock()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/library", a.library)
 	mux.HandleFunc("GET /api/devices", a.devices)
@@ -84,8 +112,70 @@ func NewAdmin(ctx context.Context, s *Server, options AdminOptions) (*Admin, err
 	return a, nil
 }
 
+func previewAssetIDs(platform string, g game) map[string]string {
+	assets := make(map[string]string)
+	for _, asset := range []struct{ kind, value string }{
+		{"composite", g.Image}, {"boxart", g.Thumbnail}, {"screenshot", g.Screenshot},
+		{"wheel", g.Wheel}, {"marquee", g.Marquee}, {"fanart", g.Fanart},
+		{"video", g.Video}, {"manual", g.Manual},
+	} {
+		if asset.value != "" {
+			assets[asset.kind] = path.Join(platform, asset.value)
+		}
+	}
+	return assets
+}
+
+func (a *Admin) publishPreview(platform string, g game) {
+	a.previewMu.Lock()
+	defer a.previewMu.Unlock()
+	a.previews[path.Join(platform, g.Path)] = g
+	for _, id := range previewAssetIDs(platform, g) {
+		a.previewAssets[id] = true
+	}
+	a.previewVersion++
+}
+
+func (a *Admin) clearPreviews(platform string) {
+	a.previewMu.Lock()
+	defer a.previewMu.Unlock()
+	for id := range a.previews {
+		if strings.HasPrefix(id, platform+"/") {
+			delete(a.previews, id)
+		}
+	}
+	for id := range a.previewAssets {
+		if strings.HasPrefix(id, platform+"/") {
+			delete(a.previewAssets, id)
+		}
+	}
+	a.previewVersion++
+}
+
 func (a *Admin) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.control.ServeHTTP(w, r) }
-func (a *Admin) Close()                                           { a.jobs.close() }
+func (a *Admin) Close() {
+	a.jobs.close()
+	a.server.scanMu.Lock()
+	a.server.onPlatformScanned = nil
+	a.server.scanMu.Unlock()
+}
+
+func (a *Admin) platformScanned(platform, revision, completed string) {
+	a.metadataMu.Lock()
+	defer a.metadataMu.Unlock()
+	a.scanRevisions[platform] = revision
+	target := digest(revision + "\x00" + a.source)
+	if completed == target || a.attempts[platform].revision == target {
+		return
+	}
+	job, err := a.jobs.enqueue(platform)
+	if err != nil {
+		a.server.log.Error("automatic metadata job not queued", "platform", platform, "error", err)
+		return
+	}
+	a.attempts[platform] = metadataAttempt{revision: target, job: job}
+	a.server.log.Info("metadata queued after system scan", "platform", platform)
+}
 
 func (a *Admin) json(w http.ResponseWriter, code int, value any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -115,10 +205,6 @@ func (a *Admin) decode(w http.ResponseWriter, r *http.Request, value any) bool {
 	}
 	return true
 }
-
-var platformPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
-
-func validPlatform(name string) bool { return platformPattern.MatchString(name) }
 
 func (a *Admin) devices(w http.ResponseWriter, r *http.Request) {
 	devices, err := Devices(a.server.state)
@@ -173,11 +259,11 @@ func (a *Admin) startJob(w http.ResponseWriter, r *http.Request) {
 	if !a.decode(w, r, &req) {
 		return
 	}
-	if !validPlatform(req.Platform) || req.Platform == generatedDir {
-		a.fail(w, http.StatusBadRequest, "use a lowercase platform identifier")
+	if _, err := canonicalPlatform(req.Platform); err != nil {
+		a.fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	info, err := a.server.roms.Stat(req.Platform)
+	platform, _, err := resolvePlatform(a.server.roms, req.Platform)
 	if errors.Is(err, os.ErrNotExist) {
 		a.fail(w, http.StatusNotFound, "platform folder not found")
 		return
@@ -186,11 +272,22 @@ func (a *Admin) startJob(w http.ResponseWriter, r *http.Request) {
 		a.storageError(w, err)
 		return
 	}
-	if !info.IsDir() {
-		a.fail(w, http.StatusBadRequest, "platform is not a directory")
-		return
+	a.server.catalogMu.RLock()
+	var entries []*pb.CatalogEntry
+	for _, entry := range a.server.catalog.Entries {
+		if entry.Platform == platform && entry.Kind == "rom" {
+			entries = append(entries, entry)
+		}
 	}
-	job, err := a.jobs.enqueue(req.Platform)
+	a.server.catalogMu.RUnlock()
+	revision := romRevision(entries)
+	a.metadataMu.Lock()
+	a.scanRevisions[platform] = revision
+	job, err := a.jobs.enqueue(platform)
+	if err == nil {
+		a.attempts[platform] = metadataAttempt{revision: digest(revision + "\x00" + a.source), job: job}
+	}
+	a.metadataMu.Unlock()
 	if errors.Is(err, errQueueFull) {
 		a.fail(w, http.StatusTooManyRequests, err.Error())
 		return
@@ -216,6 +313,7 @@ type adminGame struct {
 func (a *Admin) library(w http.ResponseWriter, r *http.Request) {
 	a.server.catalogMu.RLock()
 	catalog := a.server.catalog
+	scanError := a.server.scanError
 	a.server.catalogMu.RUnlock()
 	platforms := map[string]bool{}
 	mediaIDs := map[string]bool{}
@@ -225,15 +323,13 @@ func (a *Admin) library(w http.ResponseWriter, r *http.Request) {
 			mediaIDs[entry.Id] = true
 		}
 	}
-	dirs, err := fs.ReadDir(a.server.roms.FS(), ".")
+	dirs, err := platformFolders(a.server.roms)
 	if err != nil {
 		a.storageError(w, err)
 		return
 	}
-	for _, dir := range dirs {
-		if dir.IsDir() && !strings.HasPrefix(dir.Name(), ".") && dir.Name() != generatedDir {
-			platforms[dir.Name()] = true
-		}
+	for platform := range dirs {
+		platforms[platform] = true
 	}
 	names := make([]string, 0, len(platforms))
 	games := make([]adminGame, 0)
@@ -256,7 +352,11 @@ func (a *Admin) library(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, g := range list.Games {
-			rel, err := relativeAsset(filepath.Join(a.server.roms.Name(), platform), g.Path)
+			folder := dirs[platform]
+			if folder == "" {
+				folder = platform
+			}
+			rel, err := relativeAsset(filepath.Join(a.server.roms.Name(), folder), g.Path)
 			if err != nil {
 				a.storageError(w, err)
 				return
@@ -265,14 +365,30 @@ func (a *Admin) library(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Strings(names)
+	a.previewMu.RLock()
+	previews := maps.Clone(a.previews)
+	previewVersion := a.previewVersion
+	a.previewMu.RUnlock()
+	for id, preview := range previews {
+		if len(previewAssetIDs(strings.SplitN(id, "/", 2)[0], preview)) != 0 {
+			scraped[id] = preview
+		} else {
+			meta := scraped[id]
+			if preview.Name != "" {
+				meta.Name = preview.Name
+			}
+			meta.Path, meta.Other = preview.Path, preview.Other
+			scraped[id] = meta
+		}
+	}
 	for _, entry := range catalog.Entries {
 		if entry.Kind != "rom" {
 			continue
 		}
-		g := adminGame{ID: entry.Id, Platform: entry.Platform, Title: entry.Title, Size: entry.Size, Checksum: entry.Sha256, Metadata: map[string]string{}, Assets: map[string]string{}}
+		g := adminGame{ID: entry.Id, Platform: entry.Platform, Title: friendlyTitle(entry.Title), Size: entry.Size, Checksum: entry.Sha256, Metadata: map[string]string{}, Assets: map[string]string{}}
 		if meta, ok := scraped[entry.Id]; ok {
-			if meta.Name != "" {
-				g.Title = meta.Name
+			if name := strings.TrimSpace(meta.Name); name != "" {
+				g.Title = friendlyTitle(name)
 			}
 			for _, e := range meta.Other {
 				var value struct {
@@ -291,8 +407,16 @@ func (a *Admin) library(w http.ResponseWriter, r *http.Request) {
 					g.Assets[assetNames[asset.AssetType]] = asset.Id
 				}
 			}
+			if preview, exists := previews[entry.Id]; exists {
+				for name, id := range previewAssetIDs(entry.Platform, preview) {
+					g.Assets[name] = id
+					if name == "composite" {
+						g.Image = id
+					}
+				}
+			}
 			if meta.Image != "" {
-				rel, err := relativeAsset(filepath.Join(a.server.roms.Name(), entry.Platform), meta.Image)
+				rel, err := relativeAsset(filepath.Join(a.server.roms.Name(), dirs[entry.Platform]), meta.Image)
 				if err != nil {
 					a.storageError(w, err)
 					return
@@ -305,12 +429,20 @@ func (a *Admin) library(w http.ResponseWriter, r *http.Request) {
 		}
 		games = append(games, g)
 	}
+	data, err := json.Marshal(games)
+	if err != nil {
+		a.storageError(w, err)
+		return
+	}
+	revision := digest(fmt.Sprintf("%s\x00%d\x00%s", catalog.Revision, previewVersion, data))
 	a.json(w, http.StatusOK, struct {
 		Revision  string      `json:"revision"`
 		Platforms []string    `json:"platforms"`
 		Games     []adminGame `json:"games"`
 		MaxROM    int64       `json:"max_rom_bytes"`
-	}{catalog.Revision, names, games, a.maxROM})
+		Indexing  bool        `json:"indexing"`
+		ScanError string      `json:"scan_error,omitempty"`
+	}{revision, names, games, a.maxROM, catalog.Revision == "", scanError})
 }
 
 func (a *Admin) media(w http.ResponseWriter, r *http.Request) {
@@ -324,6 +456,11 @@ func (a *Admin) media(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.server.catalogMu.RUnlock()
+	if !found && strings.HasSuffix(id, ".png") {
+		a.previewMu.RLock()
+		found = a.previewAssets[id]
+		a.previewMu.RUnlock()
+	}
 	if !found {
 		a.fail(w, http.StatusNotFound, "image not found")
 		return
@@ -359,19 +496,27 @@ func validROMFilename(name string) bool {
 
 func (a *Admin) upload(w http.ResponseWriter, r *http.Request) {
 	platform, name := r.URL.Query().Get("platform"), r.URL.Query().Get("name")
-	if !validPlatform(platform) || platform == generatedDir || !validROMFilename(name) {
-		a.fail(w, http.StatusBadRequest, "valid lowercase platform and a ROM filename without path separators required")
+	platform, err := canonicalPlatform(platform)
+	if err != nil || !validROMFilename(name) {
+		a.fail(w, http.StatusBadRequest, "valid system name and a ROM filename without path separators required")
 		return
 	}
 	if r.ContentLength > a.maxROM {
 		a.fail(w, http.StatusRequestEntityTooLarge, "ROM exceeds upload limit")
 		return
 	}
-	if err := a.server.roms.Mkdir(platform, 0755); err != nil && !errors.Is(err, os.ErrExist) {
+	_, physical, err := resolvePlatform(a.server.roms, platform)
+	if errors.Is(err, fs.ErrNotExist) {
+		physical = platform
+	} else if err != nil {
 		a.storageError(w, err)
 		return
 	}
-	dir, err := a.server.roms.OpenRoot(platform)
+	if err := a.server.roms.Mkdir(physical, 0755); err != nil && !errors.Is(err, os.ErrExist) {
+		a.storageError(w, err)
+		return
+	}
+	dir, err := a.server.roms.OpenRoot(physical)
 	if err != nil {
 		a.storageError(w, err)
 		return
@@ -439,10 +584,11 @@ func (a *Admin) upload(w http.ResponseWriter, r *http.Request) {
 		a.server.log.Error("post-upload scan failed", "error", err)
 		warnings = append(warnings, "ROM stored but catalog refresh failed; check server logs")
 	}
-	job, err := a.jobs.enqueue(platform)
-	if err != nil {
-		a.server.log.Error("automatic metadata job not queued", "error", err)
-		warnings = append(warnings, "ROM stored but metadata was not queued: "+err.Error())
+	a.metadataMu.Lock()
+	job := a.attempts[platform].job
+	a.metadataMu.Unlock()
+	if job.ID == "" {
+		warnings = append(warnings, "ROM stored but metadata was not queued; check server logs")
 	}
 	a.server.log.Info("ROM uploaded", "platform", platform, "name", name, "size", size)
 	a.json(w, http.StatusCreated, struct {

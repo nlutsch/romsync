@@ -26,7 +26,8 @@ import (
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	_, noColor := os.LookupEnv("NO_COLOR")
+	log := slog.New(newConsoleHandler(os.Stderr, term.IsTerminal(int(os.Stderr.Fd())) && !noColor))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := run(ctx, os.Args[1:], log); err != nil {
@@ -49,7 +50,7 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	}
 	defaults := server.DefaultSettings(filepath.Dir(executable))
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
-	configPath := flags.String("config", filepath.Join(filepath.Dir(executable), "romsync.json"), "configuration file (defaults beside executable)")
+	configPath := flags.String("config", "romsync.json", "configuration file (defaults to romsync.json in the working directory)")
 	state := flags.String("state", defaults.StatePath, "private state directory, outside ROM root")
 	roms := flags.String("roms", "", "ROM root: <platform>/<game>")
 	listen := flags.String("listen", defaults.Listen, "gRPC listen address")
@@ -62,7 +63,7 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	wsl := flags.String("skyscraper-wsl", "", "Windows only: Skyscraper WSL distribution")
 	source := flags.String("source", defaults.Source, "Skyscraper scraping module")
 	timeout := flags.Duration("timeout", 30*time.Minute, "enrichment timeout")
-	webListen := flags.String("web-listen", defaults.WebListen, "loopback admin HTTP address")
+	webListen := flags.String("web-listen", defaults.WebListen, "dashboard HTTP listen address")
 	maxROM := flags.Int64("max-rom-bytes", defaults.MaxROMBytes, "maximum admin ROM upload size")
 	username := flags.String("username", "", "username for reset-password (defaults to saved username)")
 	if err := flags.Parse(args); err != nil {
@@ -244,7 +245,8 @@ func startServices(ctx context.Context, config server.Settings, store *server.Co
 	if err := server.ValidateSettings(&config, store.Path(), true); err != nil {
 		return nil, err
 	}
-	app, err := server.New(config.ROMPath, config.StatePath, config.MaxSaveBytes, log)
+	log.Info("initializing device sync", "status", "loading cached ROM library")
+	app, err := server.NewCachedContext(ctx, config.ROMPath, config.StatePath, config.MaxSaveBytes, log)
 	if err != nil {
 		return nil, err
 	}
@@ -322,6 +324,13 @@ func serveManaged(ctx context.Context, store *server.ConfigStore, control *serve
 			}
 		}
 		address = webListener.Addr().String()
+		if config.Auth.Mode != "" {
+			control.Detach()
+		}
+		web := &http.Server{Handler: control, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Minute, WriteTimeout: 30 * time.Minute, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+		webErr := make(chan error, 1)
+		go func() { webErr <- web.Serve(webListener) }()
+		log.Info("admin dashboard listening", "url", "http://"+address, "config", store.Path(), "setup_required", config.Auth.Mode == "")
 		var runtime *runningServices
 		var runtimeErr error
 		if config.Auth.Mode != "" {
@@ -336,10 +345,6 @@ func serveManaged(ctx context.Context, store *server.ConfigStore, control *serve
 		} else {
 			control.SetRuntime(nil, applied, errors.Join(bindErr, runtimeErr))
 		}
-		web := &http.Server{Handler: control, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Minute, WriteTimeout: 30 * time.Minute, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
-		webErr := make(chan error, 1)
-		go func() { webErr <- web.Serve(webListener) }()
-		log.Info("admin dashboard listening", "url", "http://"+address, "config", store.Path(), "setup_required", config.Auth.Mode == "")
 		var watchErr, serveErr <-chan error
 		if runtime != nil {
 			watchErr, serveErr = runtime.watchErr, runtime.serveErr

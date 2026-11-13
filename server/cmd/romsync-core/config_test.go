@@ -33,7 +33,11 @@ func launchConfigured(t *testing.T, name string, extra ...string) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	args := append([]string{"serve", "-config", name}, extra...)
+	args := []string{"serve"}
+	if name != "" {
+		args = append(args, "-config", name)
+	}
+	args = append(args, extra...)
 	go func() { done <- run(ctx, args, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
 	var once sync.Once
 	stop := func() {
@@ -51,6 +55,42 @@ func launchConfigured(t *testing.T, name string, extra ...string) func() {
 	}
 	t.Cleanup(stop)
 	return stop
+}
+
+func TestDefaultConfigUsesWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previous); err != nil {
+			t.Error(err)
+		}
+	})
+
+	address, deviceAddress := freeAddress(t), freeAddress(t)
+	stop := launchConfigured(t, "", "-web-listen", address, "-listen", deviceAddress)
+	waitControl(t, address, 1, false)
+	roms := filepath.Join(dir, "roms")
+	if err := os.Mkdir(roms, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settings := server.DefaultSettings(dir)
+	settings.ROMPath, settings.WebListen, settings.Listen = roms, address, deviceAddress
+	httpConfig(t, "POST", address, "/api/setup", map[string]any{"settings": settings, "mode": "anonymous"}, 201)
+	stop()
+
+	store, err := server.LoadConfig(filepath.Join(dir, "romsync.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Snapshot().Auth.Mode != "anonymous" {
+		t.Fatal("default config was not saved in the working directory")
+	}
 }
 
 func httpConfig(t *testing.T, method, address, path string, value any, code int) map[string]json.RawMessage {

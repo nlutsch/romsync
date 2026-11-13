@@ -32,6 +32,12 @@ func fakeScraper(args []string) error {
 	for i := 0; i+1 < len(args); i += 2 {
 		options[args[i]] = args[i+1]
 	}
+	if platform := os.Getenv("ROMSYNC_TEST_SCRAPER_PLATFORM"); platform != "" && options["-p"] != platform {
+		return fmt.Errorf("scraper received noncanonical platform %q", options["-p"])
+	}
+	if folder := os.Getenv("ROMSYNC_TEST_SCRAPER_FOLDER"); folder != "" && filepath.Base(options["-i"]) != folder {
+		return fmt.Errorf("scraper did not receive physical ROM directory: %q", options["-i"])
+	}
 	if (options["-f"] != "emulationstation" && options["-f"] != "batocera" && options["-f"] != "pegasus") || !strings.HasPrefix(options["--flags"], "unattend,relative") {
 		return fmt.Errorf("incorrect export options")
 	}
@@ -83,22 +89,24 @@ func fakeScraper(args []string) error {
 
 func TestEnrichRunsGatherThenExport(t *testing.T) {
 	t.Setenv("ROMSYNC_TEST_SCRAPER", "1")
+	t.Setenv("ROMSYNC_TEST_SCRAPER_PLATFORM", "snes")
+	t.Setenv("ROMSYNC_TEST_SCRAPER_FOLDER", "SFC")
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, "snes"), 0755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, "SFC"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "snes", "game.sfc"), []byte("ROM"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "SFC", "game.sfc"), []byte("ROM"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Enrich(context.Background(), root, "snes", ScraperOptions{Binary: binary, Source: "screenscraper"}, io.Discard); err != nil {
+	if err := Enrich(context.Background(), root, "SNES", ScraperOptions{Binary: binary, Source: "screenscraper"}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	// A second export exercises atomic replacement of existing manifests and assets.
-	if err := Enrich(context.Background(), root, "snes", ScraperOptions{Binary: binary, Source: "screenscraper"}, io.Discard); err != nil {
+	if err := Enrich(context.Background(), root, "sfc", ScraperOptions{Binary: binary, Source: "screenscraper"}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"gamelist.xml", "miyoogamelist.xml", "tvosgamelist.xml"} {
@@ -121,6 +129,55 @@ func TestEnrichRunsGatherThenExport(t *testing.T) {
 		if err != nil || cfg.Width != 100 || cfg.Height != 50 {
 			t.Fatalf("small image upscaled: %v %v", cfg, err)
 		}
+	}
+}
+
+func TestEnrichPublishesStagedProgress(t *testing.T) {
+	t.Setenv("ROMSYNC_TEST_SCRAPER", "1")
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "snes"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "snes", "game.sfc"), []byte("ROM"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	publish := func(g game) {
+		count++
+		if g.Name != "Test" || g.Path != "./game.sfc" || len(g.Other) == 0 {
+			t.Fatalf("incomplete metadata preview: %+v", g)
+		}
+		if _, err := os.Stat(filepath.Join(root, generatedDir, "snes", "gamelist.xml")); !os.IsNotExist(err) {
+			t.Fatal("progress waited until the platform manifest was complete")
+		}
+		switch count {
+		case 1:
+			if g.Image != "" || g.Video != "" || g.Manual != "" {
+				t.Fatal("text preview exposed raw scraper asset paths")
+			}
+			if _, err := os.Stat(filepath.Join(root, generatedDir, "snes", ".logos", "metadata.pegasus.txt")); !os.IsNotExist(err) {
+				t.Fatal("text preview waited for later export passes")
+			}
+		case 2:
+			if !strings.HasPrefix(g.Image, "./media/batocera/") {
+				t.Fatalf("profile preview contains invalid artwork: %q", g.Image)
+			}
+			if _, err := os.Stat(filepath.Join(root, generatedDir, "snes", filepath.FromSlash(g.Image))); err != nil {
+				t.Fatal("game published before its artwork was available")
+			}
+		default:
+			t.Fatal("non-dashboard profile unexpectedly published a preview")
+		}
+	}
+	if err := Enrich(context.Background(), root, "snes", ScraperOptions{Binary: binary, Source: "screenscraper", progress: publish}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected text and completed-game updates, got %d", count)
 	}
 }
 

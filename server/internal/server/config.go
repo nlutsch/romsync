@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,7 +28,8 @@ type Settings struct {
 	StatePath       string `json:"state_path"`
 	Listen          string `json:"listen"`
 	WebListen       string `json:"web_listen"`
-	DashboardURL    string `json:"dashboard_url"`
+	DashboardLANURL string `json:"dashboard_lan_url,omitempty"` // Legacy setting; no longer used.
+	DashboardURL    string `json:"dashboard_url,omitempty"`     // Legacy setting; no longer used.
 	TLSCert         string `json:"tls_cert"`
 	TLSKey          string `json:"tls_key"`
 	MaxSaveBytes    int64  `json:"max_save_bytes"`
@@ -60,8 +60,8 @@ type ConfigStore struct {
 }
 
 func DefaultSettings(base string) Settings {
-	return Settings{StatePath: filepath.Join(base, "data"), Listen: "127.0.0.1:7777",
-		WebListen: "127.0.0.1:8080", MaxSaveBytes: 64 << 20, MaxROMBytes: 2 << 30,
+	return Settings{StatePath: filepath.Join(base, "data"), Listen: "0.0.0.0:7777",
+		WebListen: "0.0.0.0:18777", MaxSaveBytes: 64 << 20, MaxROMBytes: 2 << 30,
 		Skyscraper: "Skyscraper", Source: "screenscraper", TimeoutSeconds: 1800}
 }
 
@@ -205,8 +205,8 @@ func verifyLogin(auth DashboardAuth, username, password string) bool {
 	return err == nil && subtle.ConstantTimeCompare(hash, expected) == 1 && username == auth.Username
 }
 
-func loopbackAddress(address string) error {
-	host, port, err := net.SplitHostPort(address)
+func validateListen(address string) error {
+	_, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return err
 	}
@@ -214,16 +214,12 @@ func loopbackAddress(address string) error {
 	if err != nil || number < 0 || number > 65535 {
 		return fmt.Errorf("port must be a number between 0 and 65535")
 	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("address must use a loopback IP")
-	}
 	return nil
 }
 
 func ValidateWebListen(address string) error {
-	if err := loopbackAddress(address); err != nil {
-		return fmt.Errorf("admin HTTP must use a loopback IP: %w", err)
+	if err := validateListen(address); err != nil {
+		return fmt.Errorf("dashboard listen address: %w", err)
 	}
 	return nil
 }
@@ -306,30 +302,19 @@ func ValidateSettings(settings *Settings, configPath string, requireROM bool) er
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("state directory: %w", err)
 	}
-	if err := loopbackAddress(settings.WebListen); err != nil {
-		return fmt.Errorf("admin HTTP: %w; use Nginx HTTPS for remote access", err)
+	if err := ValidateWebListen(settings.WebListen); err != nil {
+		return fmt.Errorf("admin HTTP: %w", err)
 	}
-	if settings.DashboardURL != "" {
-		u, err := url.Parse(settings.DashboardURL)
-		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-			return fmt.Errorf("public dashboard URL must be an HTTPS origin, e.g. https://romsync.example.com")
-		}
-		settings.DashboardURL = strings.TrimSuffix(u.String(), "/")
-	}
-	if _, port, err := net.SplitHostPort(settings.Listen); err != nil {
+	if err := validateListen(settings.Listen); err != nil {
 		return fmt.Errorf("gRPC listen address: %w", err)
-	} else if number, err := strconv.Atoi(port); err != nil || number < 0 || number > 65535 {
-		return fmt.Errorf("gRPC port must be a number between 0 and 65535")
 	}
 	if (settings.TLSCert == "") != (settings.TLSKey == "") {
 		return fmt.Errorf("TLS certificate and key must be specified together")
 	}
-	if settings.TLSCert == "" {
-		if err := loopbackAddress(settings.Listen); err != nil {
-			return fmt.Errorf("plaintext gRPC: %w; configure TLS for remote access", err)
+	if settings.TLSCert != "" {
+		if _, err := credentials.NewServerTLSFromFile(settings.TLSCert, settings.TLSKey); err != nil {
+			return fmt.Errorf("TLS configuration: %w", err)
 		}
-	} else if _, err := credentials.NewServerTLSFromFile(settings.TLSCert, settings.TLSKey); err != nil {
-		return fmt.Errorf("TLS configuration: %w", err)
 	}
 	if settings.MaxSaveBytes <= 0 || settings.MaxSaveBytes > 1<<40 || settings.MaxROMBytes <= 0 || settings.MaxROMBytes > 1<<40 {
 		return fmt.Errorf("upload limits must be between 1 byte and 1 TiB")

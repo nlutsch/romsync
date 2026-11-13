@@ -23,17 +23,41 @@ const ChunkSize = 64 * 1024
 
 type Server struct {
 	pb.UnimplementedRomSyncServer
-	state, roms *os.Root
-	log         *slog.Logger
-	maxSave     int64
-	mu          sync.Mutex
-	scanMu      sync.Mutex
-	catalogMu   sync.RWMutex
-	catalog     *pb.Catalog
-	changed     chan struct{}
+	state, roms       *os.Root
+	log               *slog.Logger
+	maxSave           int64
+	mu                sync.Mutex
+	scanMu            sync.Mutex
+	catalogMu         sync.RWMutex
+	catalog           *pb.Catalog
+	changed           chan struct{}
+	cache             catalogCache
+	physicalPaths     map[string]string
+	onPlatformScanned func(string, string, string)
+	scanError         string
 }
 
 func New(romPath, statePath string, maxSave int64, log *slog.Logger) (*Server, error) {
+	return NewContext(context.Background(), romPath, statePath, maxSave, log)
+}
+
+func NewContext(ctx context.Context, romPath, statePath string, maxSave int64, log *slog.Logger) (*Server, error) {
+	s, err := NewCachedContext(ctx, romPath, statePath, maxSave, log)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.scan(ctx); err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// NewCachedContext opens storage without waiting for hashing; Watch reconciles it.
+func NewCachedContext(ctx context.Context, romPath, statePath string, maxSave int64, log *slog.Logger) (*Server, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if maxSave <= 0 {
 		return nil, fmt.Errorf("max save bytes must be positive")
 	}
@@ -71,10 +95,7 @@ func New(romPath, statePath string, maxSave int64, log *slog.Logger) (*Server, e
 		return nil, err
 	}
 	s := &Server{state: state, roms: roms, log: log, maxSave: maxSave, changed: make(chan struct{})}
-	if err := s.Scan(); err != nil {
-		s.Close()
-		return nil, err
-	}
+	s.initializeCache()
 	return s, nil
 }
 
