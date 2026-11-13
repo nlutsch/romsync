@@ -1,4 +1,5 @@
 /bin/
+/romsync-core
 /data/
 *.test
 /romsync.json
